@@ -67,7 +67,7 @@ Milestone checkboxes (`[x]`) mean the named code or page is present. They do **n
 | 24 | Audit & Compliance | `audit-service` | ✅ Scaffolded | Phase 4 |
 | 25 | Nexus (Cross-org Sharing) | `nexus-service` | ✅ Scaffolded | Phase 5 |
 
-Current repo audit: 24 of 25 Foundry-shaped components have a crate and/or UI route. That is coverage of the map, not feature-complete parity. Auth is the only row marked in progress (OIDC exists; SAML sign-in is still pending). Gateway rate limiting is now in-process only; Redis and multi-instance coordination are not built.
+Current repo audit: 24 of 25 Foundry-shaped components have a crate and/or UI route. That is coverage of the map, not feature-complete parity. Auth is the only row marked in progress (OIDC exists; SAML sign-in is still pending). The gateway control hop (auth allowlist, trusted headers, audit, Redis-backed rate limits with memory fallback, streamed bodies) is production-oriented; domain services behind it are still scaffolded.
 
 ---
 

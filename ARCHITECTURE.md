@@ -65,7 +65,15 @@ Services must not trust the client for that scope. The only trusted copy is the 
 5. Hop-by-hop headers (`host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `te`, `proxy-*`, plus names listed in `Connection`) are not forwarded.
 6. Downstream services may read those headers, but they are only as trustworthy as this gateway hop. There is no service-to-service mTLS yet.
 
-Unauthenticated routes (`/health`, login/register) still pass through the gateway; they simply have no tenant headers.
+The gateway **rejects** requests without a valid access or API-key JWT (`401 unauthorized`), except this public allowlist:
+
+- `GET/HEAD /health`
+- `POST /api/v1/auth/login`, `/register`, `/refresh`, `/mfa/complete`
+- `GET /api/v1/auth/sso/providers/public`
+- `GET /api/v1/auth/sso/providers/{slug}/start`
+- `POST /api/v1/auth/sso/callback`
+
+Refresh tokens (`token_use=refresh`) are not accepted as API credentials.
 
 ## Gateway audit and NATS
 
@@ -88,7 +96,8 @@ Each request produces one audit payload (`action = request.forwarded`):
 | Upstream down | `502 upstream unavailable` | Gateway logs the reqwest error |
 | Request body over tenant clamp | `413 body too large` | Declared `Content-Length` is rejected up front; a streamed body that exceeds the remaining budget aborts the upstream call |
 | Tenant or IP over `requests_per_minute` | `429 rate limit exceeded` + `Retry-After` | In-process token bucket; `/health` is exempt. Not shared across gateway replicas |
-| Invalid JWT | Request is proxied without tenant headers | Downstream must treat the call as unscoped |
+| Missing/invalid JWT on a private route | `401 unauthorized` | Request never reaches a backend service |
+| Refresh token used as an access token | `401 unauthorized` | `token_use` must be `access`, `api_key`, or unset |
 | NATS down at boot | API still works | Audit handle is disabled |
 | NATS down at runtime | API still works | Worker logs publish failures; queue may drop |
 | Audit queue full | API still works | Event dropped (`queue full`) |
@@ -96,7 +105,11 @@ Each request produces one audit payload (`action = request.forwarded`):
 
 ## Rate limiting
 
-The gateway keeps an in-memory token bucket per tenant scope (JWT) or client IP (`X-Forwarded-For` / `X-Real-IP`). Capacity and refill follow `TenantContext.quotas.requests_per_minute` (anonymous callers use the standard 300/min policy). This is per process: two gateway replicas do not share counters. Redis-backed limiting is not implemented.
+When `REDIS_URL` is set, the gateway uses a one-minute Redis fixed window (`INCR` + `EXPIRE`) so replicas share counters. If Redis is down at boot or at check time, it falls back to the in-memory token bucket (per process, max 10,000 keys, stale buckets evicted).
+
+Authenticated callers use `TenantContext.quotas.requests_per_minute`. Anonymous and login traffic use `ANONYMOUS_REQUESTS_PER_MINUTE` (default 60). `/health` is exempt.
+
+Client IP comes from the TCP peer. `X-Forwarded-For` / `X-Real-IP` are read only when `TRUST_FORWARDED_HEADERS=true` (set this only behind a trusted proxy).
 
 ## Proxied bodies
 
@@ -104,9 +117,9 @@ Request and response bodies are streamed. The gateway does not buffer the full p
 
 ## What this map does not claim
 
-- Rate limits are not cluster-wide.
-- Gateway auth middleware is not applied as a global reject; JWT is decoded in the proxy for header injection and in the rate-limit layer for the bucket key.
-- `ROADMAP.md` status icons mean a service or UI surface exists, not that the feature is production-ready.
+- Redis rate limits are a fixed one-minute window, not a distributed token bucket.
+- There is still no service-to-service mTLS.
+- `ROADMAP.md` status icons mean a service or UI surface exists, not that every domain feature is production-ready. The gateway control hop (auth gate, header trust, audit, rate limit, streamed bodies) is what this document describes as production-ready.
 
 ## Related docs
 
