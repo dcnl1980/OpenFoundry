@@ -21,6 +21,7 @@ async fn main() {
         .expect("failed to build HTTP client");
 
     let audit = middleware::audit::connect_audit_handle(std::env::var("NATS_URL").ok().as_deref()).await;
+    let rate_limit = middleware::rate_limit::RateLimitState::new(cfg.jwt_secret.clone());
 
     // Health check (unauthenticated)
     let health = Router::new().route("/health", get(|| async { "ok" }));
@@ -31,6 +32,10 @@ async fn main() {
     let app = Router::new()
         .merge(health)
         .merge(api)
+        .layer(axum_mw::from_fn_with_state(
+            rate_limit,
+            middleware::rate_limit::rate_limit_layer,
+        ))
         .layer(axum_mw::from_fn_with_state(
             audit,
             middleware::audit::audit_layer,
