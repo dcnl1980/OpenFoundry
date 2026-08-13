@@ -63,7 +63,9 @@ Services must not trust the client for that scope. The only trusted copy is the 
    | `x-openfoundry-quota-requests-per-minute` | tier / `tenant_quotas` |
 
 5. Hop-by-hop headers (`host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `te`, `proxy-*`, plus names listed in `Connection`) are not forwarded.
-6. Downstream services may read those headers, but they are only as trustworthy as this gateway hop. There is no service-to-service mTLS yet.
+6. Downstream services may read those headers only after the hop is authenticated. In production, set `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `TLS_CA_PATH` on every service and the gateway so the hop is **mTLS**: services present a server cert, the gateway presents a client cert, and both verify the shared CA. Without those three variables the process logs a warning and serves plaintext HTTP (development only).
+7. Every domain service now starts through `service_runtime::serve`, which applies a 10 MiB default body limit and the same TLS mode. Service-to-service HTTP clients (gateway, ontology, workflow, notification) load the same client identity and CA.
+8. Domain `auth_layer` rejects refresh tokens. Protected routes already require a JWT; mTLS is what stops a caller from bypassing the gateway and talking to a service port directly.
 
 Unauthenticated routes (`/health`, login/register) still pass through the gateway; they simply have no tenant headers.
 
@@ -87,7 +89,9 @@ Each request produces one audit payload (`action = request.forwarded`):
 | Unknown `/api/v1/...` prefix | `404 unknown service route` | No upstream call |
 | Upstream down | `502 upstream unavailable` | Gateway logs the reqwest error |
 | Request body over tenant clamp | `413 body too large` | Body is not forwarded |
-| Invalid JWT | Request is proxied without tenant headers | Downstream must treat the call as unscoped |
+| Invalid JWT | Request is proxied without tenant headers | Downstream JWT auth still rejects the call |
+| Refresh token used as an access token | `401` from the domain service | `auth_layer` accepts only `access` / `api_key` |
+| mTLS required but client has no cert | TLS handshake fails / `502` at the gateway | Service never sees the HTTP request |
 | NATS down at boot | API still works | Audit handle is disabled |
 | NATS down at runtime | API still works | Worker logs publish failures; queue may drop |
 | Audit queue full | API still works | Event dropped (`queue full`) |
@@ -95,10 +99,8 @@ Each request produces one audit payload (`action = request.forwarded`):
 
 ## What this map does not claim
 
-- Rate limiting is not in the middleware stack (`rate_limit.rs` is a Phase-2 stub).
-- Proxied request/response bodies are still buffered (`to_bytes`, ~10 MiB default).
-- Gateway auth middleware is not applied as a global reject; JWT is decoded in the proxy for header injection.
-- `ROADMAP.md` status icons describe intended coverage, not production readiness of every handler.
+- Domain handlers are not a full rewrite; they now share mTLS, a 10 MiB body limit, and access-token checks.
+- `ROADMAP.md` status icons mean a service or UI surface exists, not that every domain feature is complete.
 
 ## Related docs
 

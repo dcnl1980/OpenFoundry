@@ -6,5 +6,5 @@ pub mod row_level_security;
 pub mod tenant;
 
 pub use claims::Claims;
-pub use jwt::{JwtConfig, JwtError};
+pub use jwt::{is_usable_access_token, JwtConfig, JwtError};
 pub use layer::auth_layer;

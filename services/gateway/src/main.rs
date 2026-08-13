@@ -14,11 +14,12 @@ async fn main() {
         .init();
 
     let cfg = config::GatewayConfig::from_env().expect("failed to load config");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client");
+    let tls = service_runtime::TlsSettings::from_env();
+    let client = service_runtime::configure_http_client(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+        &tls,
+    )
+    .expect("failed to build HTTP client");
 
     let audit = middleware::audit::connect_audit_handle(std::env::var("NATS_URL").ok().as_deref()).await;
 
@@ -41,10 +42,7 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     tracing::info!("starting gateway on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
+    service_runtime::serve(app, &addr, tls)
         .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app).await.expect("server error");
+        .expect("server error");
 }
