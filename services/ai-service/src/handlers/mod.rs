@@ -2,6 +2,7 @@ pub mod agents;
 pub mod chat;
 pub mod knowledge;
 pub mod prompts;
+pub mod tenant;
 pub mod tools;
 
 use axum::{http::StatusCode, Json};

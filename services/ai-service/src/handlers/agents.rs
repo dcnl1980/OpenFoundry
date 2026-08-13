@@ -5,6 +5,7 @@ use axum::{
 use chrono::Utc;
 use sqlx::{query_as, types::Json as SqlJson};
 use uuid::Uuid;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::{agents, rag},
@@ -19,9 +20,12 @@ use crate::{
 	AppState,
 };
 
-use super::{bad_request, db_error, not_found, ServiceResult};
+use super::{bad_request, db_error, internal_error, not_found, tenant::begin_scope, ServiceResult};
 
-async fn load_agent_row(db: &sqlx::PgPool, agent_id: Uuid) -> Result<Option<AgentRow>, sqlx::Error> {
+async fn load_agent_row(
+	db: &mut sqlx::PgConnection,
+	agent_id: Uuid,
+) -> Result<Option<AgentRow>, sqlx::Error> {
 	query_as::<_, AgentRow>(
 		r#"
 		SELECT
@@ -43,7 +47,7 @@ async fn load_agent_row(db: &sqlx::PgPool, agent_id: Uuid) -> Result<Option<Agen
 		"#,
 	)
 	.bind(agent_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
@@ -80,7 +84,7 @@ async fn load_tools(db: &sqlx::PgPool, tool_ids: &[Uuid]) -> Result<Vec<ToolDefi
 }
 
 async fn load_documents(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	knowledge_base_id: Uuid,
 ) -> Result<Vec<crate::models::knowledge_base::KnowledgeDocument>, sqlx::Error> {
 	let rows = query_as::<_, KnowledgeDocumentRow>(
@@ -103,13 +107,19 @@ async fn load_documents(
 		"#,
 	)
 	.bind(knowledge_base_id)
-	.fetch_all(db)
+	.fetch_all(&mut *db)
 	.await?;
 
 	Ok(rows.into_iter().map(Into::into).collect())
 }
 
-pub async fn list_agents(State(state): State<AppState>) -> ServiceResult<ListAgentsResponse> {
+pub async fn list_agents(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListAgentsResponse> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
 	let rows = query_as::<_, AgentRow>(
 		r#"
 		SELECT
@@ -130,9 +140,13 @@ pub async fn list_agents(State(state): State<AppState>) -> ServiceResult<ListAge
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list agents commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ListAgentsResponse {
 		data: rows.into_iter().map(Into::into).collect(),
@@ -141,12 +155,17 @@ pub async fn list_agents(State(state): State<AppState>) -> ServiceResult<ListAge
 
 pub async fn create_agent(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateAgentRequest>,
 ) -> ServiceResult<AgentDefinition> {
 	if body.name.trim().is_empty() {
 		return Err(bad_request("agent name is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let tenant_id = claims.tenant_scope_id();
 	let row = query_as::<_, AgentRow>(
 		r#"
 		INSERT INTO ai_agents (
@@ -160,9 +179,10 @@ pub async fn create_agent(
 			planning_strategy,
 			max_iterations,
 			memory,
-			last_execution_at
+			last_execution_at,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11)
 		RETURNING
 			id,
 			name,
@@ -189,19 +209,28 @@ pub async fn create_agent(
 	.bind(body.planning_strategy)
 	.bind(body.max_iterations)
 	.bind(SqlJson(crate::models::agent::AgentMemorySnapshot::default()))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create agent commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn update_agent(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(agent_id): Path<Uuid>,
 	Json(body): Json<UpdateAgentRequest>,
 ) -> ServiceResult<AgentDefinition> {
-	let Some(current) = load_agent_row(&state.db, agent_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(current) = load_agent_row(&mut tx, agent_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -249,15 +278,20 @@ pub async fn update_agent(
 	.bind(body.planning_strategy.unwrap_or(agent.planning_strategy))
 	.bind(body.max_iterations.unwrap_or(agent.max_iterations))
 	.bind(SqlJson(body.memory.unwrap_or(agent.memory)))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("update agent commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn execute_agent(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(agent_id): Path<Uuid>,
 	Json(body): Json<ExecuteAgentRequest>,
 ) -> ServiceResult<AgentExecutionResponse> {
@@ -265,7 +299,10 @@ pub async fn execute_agent(
 		return Err(bad_request("agent execution requires a user message"));
 	}
 
-	let Some(current) = load_agent_row(&state.db, agent_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(current) = load_agent_row(&mut tx, agent_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -278,7 +315,7 @@ pub async fn execute_agent(
 		.map_err(|cause| db_error(&cause))?;
 
 	let knowledge_hits = if let Some(knowledge_base_id) = body.knowledge_base_id {
-		let documents = load_documents(&state.db, knowledge_base_id)
+		let documents = load_documents(&mut tx, knowledge_base_id)
 			.await
 			.map_err(|cause| db_error(&cause))?;
 		rag::retriever::search(&body.user_message, &documents, 4, 0.55)
@@ -312,9 +349,13 @@ pub async fn execute_agent(
 	)
 	.bind(agent_id)
 	.bind(SqlJson(updated_memory))
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("execute agent commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(AgentExecutionResponse {
 		agent_id,

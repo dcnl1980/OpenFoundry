@@ -1,9 +1,10 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::cron,
-	handlers::{bad_request, db_error, internal_error, load_all_reports, load_execution_history, load_report_row, not_found, ServiceResult},
+	handlers::{bad_request, db_error, internal_error, load_all_reports, load_execution_history, load_report_row, not_found, tenant::begin_scope, ServiceResult},
 	models::{
 		report::{CreateReportRequest, ReportDefinition, UpdateReportRequest},
 		snapshot::ReportOverview,
@@ -12,9 +13,15 @@ use crate::{
 	AppState,
 };
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<ReportOverview> {
-	let reports = load_all_reports(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let recent_executions = load_execution_history(&state.db, None, 6)
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ReportOverview> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let reports = load_all_reports(&mut tx).await.map_err(|cause| db_error(&cause))?;
+	let recent_executions = load_execution_history(&mut tx, None, 6)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let active_schedules = reports.iter().filter(|report| report.schedule.enabled).count();
@@ -28,6 +35,10 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<Report
 		.collect::<Vec<_>>();
 	generator_mix.sort();
 	generator_mix.dedup();
+	tx.commit().await.map_err(|error| {
+		tracing::error!("get overview commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ReportOverview {
 		report_count: reports.len(),
@@ -38,13 +49,24 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<Report
 	}))
 }
 
-pub async fn list_reports(State(state): State<AppState>) -> ServiceResult<ListResponse<ReportDefinition>> {
-	let reports = load_all_reports(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_reports(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<ReportDefinition>> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let reports = load_all_reports(&mut tx).await.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list reports commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 	Ok(Json(ListResponse { items: reports }))
 }
 
 pub async fn create_report(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateReportRequest>,
 ) -> ServiceResult<ReportDefinition> {
 	if request.name.trim().is_empty() {
@@ -55,6 +77,9 @@ pub async fn create_report(
 		return Err(bad_request("at least one template section is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let schedule = cron::normalize_schedule(request.schedule, now);
@@ -62,10 +87,11 @@ pub async fn create_report(
 	let schedule_value = serde_json::to_value(&schedule).map_err(|cause| internal_error(cause.to_string()))?;
 	let recipients = serde_json::to_value(&request.recipients).map_err(|cause| internal_error(cause.to_string()))?;
 	let tags = serde_json::to_value(&request.tags).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO report_definitions (id, name, description, owner, generator_kind, dataset_name, template, schedule, recipients, tags, parameters, active, last_generated_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, NULL, $13, $14)",
+		"INSERT INTO report_definitions (id, name, description, owner, generator_kind, dataset_name, template, schedule, recipients, tags, parameters, active, last_generated_at, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, NULL, $13, $14, $15)",
 	)
 	.bind(id)
 	.bind(request.name)
@@ -81,14 +107,19 @@ pub async fn create_report(
 	.bind(request.active)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_report_row(&state.db, id)
+	let row = load_report_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created report could not be reloaded"))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create report commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	let report = ReportDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(report))
@@ -97,9 +128,13 @@ pub async fn create_report(
 pub async fn update_report(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateReportRequest>,
 ) -> ServiceResult<ReportDefinition> {
-	let existing_row = load_report_row(&state.db, id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let existing_row = load_report_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("report not found"))?;
@@ -179,14 +214,18 @@ pub async fn update_report(
 	.bind(&report.parameters)
 	.bind(report.active)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_report_row(&state.db, id)
+	let row = load_report_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated report could not be reloaded"))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("update report commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	let report = ReportDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(report))

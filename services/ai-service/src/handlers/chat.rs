@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use sqlx::{query_as, query_scalar, types::Json as SqlJson, FromRow};
 use uuid::Uuid;
 
+use auth_middleware::layer::AuthUser;
+
 use crate::{
 	domain::{copilot, evaluation, llm, rag},
 	models::{
@@ -30,7 +32,7 @@ use crate::{
 	AppState,
 };
 
-use super::{bad_request, db_error, not_found, ServiceResult};
+use super::{bad_request, db_error, internal_error, not_found, tenant::begin_scope, ServiceResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedChatPayload {
@@ -118,7 +120,7 @@ async fn load_provider_rows(db: &sqlx::PgPool) -> Result<Vec<ProviderRow>, sqlx:
 }
 
 async fn load_prompt_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	prompt_id: Uuid,
 ) -> Result<Option<PromptTemplateRow>, sqlx::Error> {
 	query_as::<_, PromptTemplateRow>(
@@ -139,12 +141,12 @@ async fn load_prompt_row(
 		"#,
 	)
 	.bind(prompt_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
 async fn load_conversation_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	conversation_id: Uuid,
 ) -> Result<Option<ConversationRow>, sqlx::Error> {
 	query_as::<_, ConversationRow>(
@@ -163,12 +165,12 @@ async fn load_conversation_row(
 		"#,
 	)
 	.bind(conversation_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
 async fn load_documents_for_bases(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	knowledge_base_ids: &[Uuid],
 ) -> Result<Vec<KnowledgeDocument>, sqlx::Error> {
 	let mut documents = Vec::new();
@@ -193,7 +195,7 @@ async fn load_documents_for_bases(
 			"#,
 		)
 		.bind(*knowledge_base_id)
-		.fetch_all(db)
+		.fetch_all(&mut *db)
 		.await?;
 
 		documents.extend(rows.into_iter().map(Into::into));
@@ -203,7 +205,7 @@ async fn load_documents_for_bases(
 }
 
 async fn find_cached_response<T>(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	kind: &str,
 	prompt: &str,
 ) -> Result<Option<(T, SemanticCacheMetadata, Option<Uuid>)>, sqlx::Error>
@@ -225,7 +227,7 @@ where
 		"#,
 	)
 	.bind(kind)
-	.fetch_all(db)
+	.fetch_all(&mut *db)
 	.await?;
 
 	let exact_key = llm::cache::cache_key(kind, prompt);
@@ -260,7 +262,7 @@ where
 		"UPDATE ai_semantic_cache SET hit_count = hit_count + 1, last_hit_at = NOW() WHERE id = $1",
 	)
 	.bind(row.id)
-	.execute(db)
+	.execute(&mut *db)
 	.await?;
 
 	let payload = serde_json::from_value(row.response.0).ok();
@@ -278,10 +280,11 @@ where
 }
 
 async fn upsert_cached_response<T>(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	kind: &str,
 	prompt: &str,
 	provider_id: Option<Uuid>,
+	tenant_id: Uuid,
 	payload: &T,
 ) -> Result<SemanticCacheMetadata, sqlx::Error>
 where
@@ -303,10 +306,11 @@ where
 			response,
 			provider_id,
 			hit_count,
-			last_hit_at
+			last_hit_at,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 0, NOW())
-		ON CONFLICT (kind, cache_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0, NOW(), $8)
+		ON CONFLICT (tenant_id, kind, cache_key)
 		DO UPDATE SET
 			normalized_prompt = EXCLUDED.normalized_prompt,
 			fingerprint = EXCLUDED.fingerprint,
@@ -322,7 +326,8 @@ where
 	.bind(SqlJson(fingerprint))
 	.bind(SqlJson(response))
 	.bind(provider_id)
-	.execute(db)
+	.bind(tenant_id)
+	.execute(&mut *db)
 	.await?;
 
 	Ok(SemanticCacheMetadata {
@@ -333,7 +338,7 @@ where
 }
 
 async fn persist_conversation(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	conversation_id: Option<Uuid>,
 	user_message: &str,
 	reply: &str,
@@ -341,6 +346,7 @@ async fn persist_conversation(
 	citations: &[KnowledgeSearchResult],
 	guardrail: &GuardrailVerdict,
 	cache_hit: bool,
+	tenant_id: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
 	let now = Utc::now();
 	let user_entry = ChatMessage {
@@ -376,7 +382,7 @@ async fn persist_conversation(
 			.bind(provider_id)
 			.bind(cache_hit)
 			.bind(guardrail.blocked)
-			.execute(db)
+			.execute(&mut *db)
 			.await?;
 
 			return Ok(conversation_id);
@@ -386,7 +392,7 @@ async fn persist_conversation(
 	let new_id = Uuid::now_v7();
 	let title = summarize_title(user_message);
 	sqlx::query(
-		"INSERT INTO ai_conversations (id, title, messages, provider_id, last_cache_hit, last_guardrail_blocked) VALUES ($1, $2, $3, $4, $5, $6)",
+		"INSERT INTO ai_conversations (id, title, messages, provider_id, last_cache_hit, last_guardrail_blocked, tenant_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 	)
 	.bind(new_id)
 	.bind(title)
@@ -394,7 +400,8 @@ async fn persist_conversation(
 	.bind(provider_id)
 	.bind(cache_hit)
 	.bind(guardrail.blocked)
-	.execute(db)
+	.bind(tenant_id)
+	.execute(&mut *db)
 	.await?;
 
 	Ok(new_id)
@@ -430,49 +437,59 @@ fn conversation_summary(conversation: Conversation) -> ConversationSummary {
 	}
 }
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<AiPlatformOverview> {
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<AiPlatformOverview> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
 	let provider_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_providers")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let prompt_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_prompt_templates WHERE status = 'active'")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let knowledge_base_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_knowledge_bases")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let indexed_document_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_knowledge_documents")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let indexed_chunk_count = query_scalar::<_, i64>("SELECT COALESCE(SUM(chunk_count), 0) FROM ai_knowledge_documents")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let agent_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_agents")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let conversation_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_conversations")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let cache_entry_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ai_semantic_cache")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let total_cache_hits = query_scalar::<_, i64>("SELECT COALESCE(SUM(hit_count), 0) FROM ai_semantic_cache")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let blocked_guardrail_events = query_scalar::<_, i64>(
 		"SELECT COUNT(*) FROM ai_conversations WHERE last_guardrail_blocked = TRUE",
 	)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("get overview commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(AiPlatformOverview {
 		provider_count,
@@ -656,7 +673,11 @@ pub async fn update_provider(
 
 pub async fn list_conversations(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListConversationsResponse> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
 	let rows = query_as::<_, ConversationRow>(
 		r#"
 		SELECT
@@ -672,9 +693,13 @@ pub async fn list_conversations(
 		ORDER BY last_activity_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list conversations commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ListConversationsResponse {
 		data: rows
@@ -687,26 +712,39 @@ pub async fn list_conversations(
 
 pub async fn get_conversation(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(conversation_id): Path<Uuid>,
 ) -> ServiceResult<Conversation> {
-	let Some(row) = load_conversation_row(&state.db, conversation_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(row) = load_conversation_row(&mut tx, conversation_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
 		return Err(not_found("conversation not found"));
 	};
+	tx.commit().await.map_err(|error| {
+		tracing::error!("get conversation commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn create_chat_completion(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<ChatCompletionRequest>,
 ) -> ServiceResult<ChatCompletionResponse> {
 	if body.user_message.trim().is_empty() {
 		return Err(bad_request("chat completion requires a user message"));
 	}
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let tenant_id = claims.tenant_scope_id();
 	let providers = load_provider_rows(&state.db)
 		.await
 		.map_err(|cause| db_error(&cause))?
@@ -718,7 +756,7 @@ pub async fn create_chat_completion(
 	}
 
 	let base_prompt = if let Some(prompt_template_id) = body.prompt_template_id {
-		let Some(prompt_row) = load_prompt_row(&state.db, prompt_template_id)
+		let Some(prompt_row) = load_prompt_row(&mut tx, prompt_template_id)
 			.await
 			.map_err(|cause| db_error(&cause))?
 		else {
@@ -743,7 +781,7 @@ pub async fn create_chat_completion(
 
 	let guardrail = llm::guardrails::evaluate_text(&body.user_message);
 	let knowledge_hits = if let Some(knowledge_base_id) = body.knowledge_base_id {
-		let documents = load_documents_for_bases(&state.db, &[knowledge_base_id])
+		let documents = load_documents_for_bases(&mut tx, &[knowledge_base_id])
 			.await
 			.map_err(|cause| db_error(&cause))?;
 		rag::retriever::search(&body.user_message, &documents, 4, 0.55)
@@ -762,7 +800,7 @@ pub async fn create_chat_completion(
 		.ok_or_else(|| not_found("no AI provider available"))?;
 
 	if let Some((payload, cache, cached_provider_id)) = find_cached_response::<CachedChatPayload>(
-		&state.db,
+		&mut tx,
 		"chat",
 		&prompt_used,
 	)
@@ -771,7 +809,7 @@ pub async fn create_chat_completion(
 	{
 		let provider_id = cached_provider_id.unwrap_or(provider.id);
 		let conversation_id = persist_conversation(
-			&state.db,
+			&mut tx,
 			body.conversation_id,
 			&body.user_message,
 			&payload.reply,
@@ -779,9 +817,14 @@ pub async fn create_chat_completion(
 			&payload.citations,
 			&guardrail,
 			true,
+			tenant_id,
 		)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+		tx.commit().await.map_err(|error| {
+			tracing::error!("create chat completion commit failed: {error}");
+			internal_error("commit failed")
+		})?;
 
 		let provider_name = providers
 			.iter()
@@ -820,11 +863,11 @@ pub async fn create_chat_completion(
 		citations: knowledge_hits.clone(),
 		completion_tokens,
 	};
-	let cache = upsert_cached_response(&state.db, "chat", &prompt_used, Some(provider.id), &payload)
+	let cache = upsert_cached_response(&mut tx, "chat", &prompt_used, Some(provider.id), tenant_id, &payload)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let conversation_id = persist_conversation(
-		&state.db,
+		&mut tx,
 		body.conversation_id,
 		&body.user_message,
 		&reply,
@@ -832,9 +875,14 @@ pub async fn create_chat_completion(
 		&knowledge_hits,
 		&guardrail,
 		false,
+		tenant_id,
 	)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create chat completion commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ChatCompletionResponse {
 		conversation_id,
@@ -852,12 +900,17 @@ pub async fn create_chat_completion(
 
 pub async fn ask_copilot(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CopilotRequest>,
 ) -> ServiceResult<CopilotResponse> {
 	if body.question.trim().is_empty() {
 		return Err(bad_request("copilot question is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let tenant_id = claims.tenant_scope_id();
 	let providers = load_provider_rows(&state.db)
 		.await
 		.map_err(|cause| db_error(&cause))?
@@ -877,13 +930,17 @@ pub async fn ask_copilot(
 	);
 
 	if let Some((payload, cache, cached_provider_id)) = find_cached_response::<CachedCopilotPayload>(
-		&state.db,
+		&mut tx,
 		"copilot",
 		&prompt_used,
 	)
 	.await
 	.map_err(|cause| db_error(&cause))?
 	{
+		tx.commit().await.map_err(|error| {
+			tracing::error!("ask copilot commit failed: {error}");
+			internal_error("commit failed")
+		})?;
 		let provider_name = cached_provider_id
 			.and_then(|provider_id| {
 				providers
@@ -911,7 +968,7 @@ pub async fn ask_copilot(
 	)
 	.ok_or_else(|| not_found("no AI provider available"))?;
 
-	let documents = load_documents_for_bases(&state.db, &body.knowledge_base_ids)
+	let documents = load_documents_for_bases(&mut tx, &body.knowledge_base_ids)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let cited_knowledge = rag::retriever::search(&body.question, &documents, 6, 0.55);
@@ -952,9 +1009,13 @@ pub async fn ask_copilot(
 		cited_knowledge: cited_knowledge.clone(),
 	};
 
-	let cache = upsert_cached_response(&state.db, "copilot", &prompt_used, Some(provider.id), &payload)
+	let cache = upsert_cached_response(&mut tx, "copilot", &prompt_used, Some(provider.id), tenant_id, &payload)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("ask copilot commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(CopilotResponse {
 		answer: payload.answer,

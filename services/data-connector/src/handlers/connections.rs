@@ -9,11 +9,14 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::connectors;
 use crate::models::connection::{Connection, CreateConnectionRequest, ListConnectionsQuery, VALID_TYPES};
+use auth_middleware::layer::AuthUser;
+
+use super::tenant::begin_scope;
 
 /// POST /api/v1/connections
 pub async fn create_connection(
     State(state): State<AppState>,
-    auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+    AuthUser(claims): AuthUser,
     Json(body): Json<CreateConnectionRequest>,
 ) -> impl IntoResponse {
     // Validate connector type
@@ -37,10 +40,15 @@ pub async fn create_connection(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let id = Uuid::now_v7();
+    let tenant_id = claims.tenant_scope_id();
     let result = sqlx::query_as::<_, Connection>(
-        r#"INSERT INTO connections (id, name, connector_type, config, owner_id)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO connections (id, name, connector_type, config, owner_id, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING *"#,
     )
     .bind(id)
@@ -48,11 +56,22 @@ pub async fn create_connection(
     .bind(&body.connector_type)
     .bind(&body.config)
     .bind(claims.sub)
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(conn) => (StatusCode::CREATED, Json(conn)).into_response(),
+        Ok(conn) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("create connection commit failed: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "create failed" })),
+                )
+                    .into_response();
+            }
+            (StatusCode::CREATED, Json(conn)).into_response()
+        }
         Err(e) => {
             tracing::error!("create connection failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "create failed" }))).into_response()
@@ -63,8 +82,13 @@ pub async fn create_connection(
 /// GET /api/v1/connections
 pub async fn list_connections(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Query(params): Query<ListConnectionsQuery>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -74,21 +98,27 @@ pub async fn list_connections(
     )
     .bind(per_page)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await;
 
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connections")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .unwrap_or(0);
 
     match connections {
-        Ok(conns) => Json(serde_json::json!({
-            "data": conns,
-            "page": page,
-            "per_page": per_page,
-            "total": total,
-        })).into_response(),
+        Ok(conns) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("list connections commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!({
+                "data": conns,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+            })).into_response()
+        }
         Err(e) => {
             tracing::error!("list connections failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -99,15 +129,26 @@ pub async fn list_connections(
 /// GET /api/v1/connections/:id
 pub async fn get_connection(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(connection_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let conn = sqlx::query_as::<_, Connection>("SELECT * FROM connections WHERE id = $1")
         .bind(connection_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await;
 
     match conn {
-        Ok(Some(c)) => Json(c).into_response(),
+        Ok(Some(c)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("get connection commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(c).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("get connection failed: {e}");
@@ -119,11 +160,16 @@ pub async fn get_connection(
 /// POST /api/v1/connections/:id/test
 pub async fn test_connection(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(connection_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let conn = match sqlx::query_as::<_, Connection>("SELECT * FROM connections WHERE id = $1")
         .bind(connection_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
         Ok(Some(c)) => c,
@@ -151,8 +197,13 @@ pub async fn test_connection(
     let _ = sqlx::query("UPDATE connections SET status = $2, updated_at = NOW() WHERE id = $1")
         .bind(connection_id)
         .bind(new_status)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await;
+
+    if let Err(error) = tx.commit().await {
+        tracing::error!("test connection commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     Json(serde_json::json!({
         "success": success,
@@ -163,15 +214,26 @@ pub async fn test_connection(
 /// DELETE /api/v1/connections/:id
 pub async fn delete_connection(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(connection_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query("DELETE FROM connections WHERE id = $1")
         .bind(connection_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("delete connection commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("delete connection failed: {e}");
