@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::claims::Claims;
@@ -84,6 +85,21 @@ pub async fn begin_tenant_transaction(
     let mut tx = pool.begin().await?;
     apply_tenant_guc(&mut tx, tenant_id).await?;
     Ok(tx)
+}
+
+/// Row returned by a `SECURITY DEFINER` due-work function.
+/// Scheduled workers discover ids this way, then open a tenant transaction.
+#[derive(Debug, Clone, FromRow)]
+pub struct DueWork {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+}
+
+pub async fn fetch_due_work(
+    pool: &sqlx::PgPool,
+    sql: &str,
+) -> Result<Vec<DueWork>, sqlx::Error> {
+    sqlx::query_as::<_, DueWork>(sql).fetch_all(pool).await
 }
 
 #[cfg(test)]

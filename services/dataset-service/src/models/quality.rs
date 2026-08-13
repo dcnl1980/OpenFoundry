@@ -58,6 +58,7 @@ pub struct DatasetProfileRecord {
 pub struct DatasetQualityRule {
 	pub id: Uuid,
 	pub dataset_id: Uuid,
+	pub tenant_id: Uuid,
 	pub name: String,
 	pub rule_type: String,
 	pub severity: String,
@@ -71,6 +72,7 @@ pub struct DatasetQualityRule {
 pub struct DatasetQualityHistoryEntry {
 	pub id: Uuid,
 	pub dataset_id: Uuid,
+	pub tenant_id: Uuid,
 	pub score: f64,
 	pub passed_rules: i32,
 	pub failed_rules: i32,
@@ -82,6 +84,7 @@ pub struct DatasetQualityHistoryEntry {
 pub struct DatasetQualityAlert {
 	pub id: Uuid,
 	pub dataset_id: Uuid,
+	pub tenant_id: Uuid,
 	pub level: String,
 	pub kind: String,
 	pub message: String,

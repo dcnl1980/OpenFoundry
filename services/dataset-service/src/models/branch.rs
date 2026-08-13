@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub struct DatasetBranch {
     pub id: Uuid,
     pub dataset_id: Uuid,
+    pub tenant_id: Uuid,
     pub name: String,
     pub version: i32,
     pub description: String,

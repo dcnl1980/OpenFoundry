@@ -9,5 +9,5 @@ pub use claims::Claims;
 pub use jwt::{is_usable_access_token, JwtConfig, JwtError};
 pub use layer::auth_layer;
 pub use row_level_security::{
-    apply_tenant_guc, begin_tenant_transaction, RlsContext, TENANT_SETTING,
+    apply_tenant_guc, begin_tenant_transaction, fetch_due_work, DueWork, RlsContext, TENANT_SETTING,
 };

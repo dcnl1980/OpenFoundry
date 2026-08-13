@@ -8,6 +8,9 @@ use query_engine::context::QueryContext;
 use tokio::fs;
 use uuid::Uuid;
 
+use auth_middleware::begin_tenant_transaction;
+use sqlx::{Postgres, Transaction};
+
 use crate::{
 	AppState,
 	domain::{
@@ -24,41 +27,52 @@ use crate::{
 	},
 };
 
+async fn tenant_tx<'a>(
+	state: &'a AppState,
+	tenant_id: Uuid,
+) -> Result<Transaction<'a, Postgres>, String> {
+	begin_tenant_transaction(&state.db, tenant_id)
+		.await
+		.map_err(|error| error.to_string())
+}
+
 pub async fn fetch_dataset_quality(
 	state: &AppState,
-	dataset_id: Uuid,
+	dataset: &Dataset,
 ) -> Result<DatasetQualityResponse, String> {
+	let mut tx = tenant_tx(state, dataset.tenant_id).await?;
 	let profile_record = sqlx::query_as::<_, DatasetProfileRecord>(
 		"SELECT profile, score, profiled_at FROM dataset_profiles WHERE dataset_id = $1",
 	)
-	.bind(dataset_id)
-	.fetch_optional(&state.db)
+	.bind(dataset.id)
+	.fetch_optional(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
 	let rules = sqlx::query_as::<_, DatasetQualityRule>(
 		"SELECT * FROM dataset_quality_rules WHERE dataset_id = $1 ORDER BY created_at ASC",
 	)
-	.bind(dataset_id)
-	.fetch_all(&state.db)
+	.bind(dataset.id)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
 	let alerts = sqlx::query_as::<_, DatasetQualityAlert>(
 		"SELECT * FROM dataset_quality_alerts WHERE dataset_id = $1 ORDER BY created_at DESC",
 	)
-	.bind(dataset_id)
-	.fetch_all(&state.db)
+	.bind(dataset.id)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
 	let history = sqlx::query_as::<_, DatasetQualityHistoryEntry>(
 		"SELECT * FROM dataset_quality_history WHERE dataset_id = $1 ORDER BY created_at ASC",
 	)
-	.bind(dataset_id)
-	.fetch_all(&state.db)
+	.bind(dataset.id)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
+	tx.commit().await.map_err(|error| error.to_string())?;
 
 	let (profile, score, profiled_at) = if let Some(record) = profile_record {
 		(
@@ -85,11 +99,12 @@ pub async fn refresh_dataset_quality(
 	dataset: &Dataset,
 	data_override: Option<Bytes>,
 ) -> Result<DatasetQualityResponse, String> {
+	let mut tx = tenant_tx(state, dataset.tenant_id).await?;
 	let rules = sqlx::query_as::<_, DatasetQualityRule>(
 		"SELECT * FROM dataset_quality_rules WHERE dataset_id = $1 ORDER BY created_at ASC",
 	)
 	.bind(dataset.id)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -110,10 +125,11 @@ pub async fn refresh_dataset_quality(
 		"SELECT score FROM dataset_quality_history WHERE dataset_id = $1 ORDER BY created_at DESC LIMIT 1",
 	)
 	.bind(dataset.id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?
 	.flatten();
+	tx.commit().await.map_err(|error| error.to_string())?;
 
 	let profile = DatasetQualityProfile {
 		row_count: generated.row_count,
@@ -136,7 +152,7 @@ pub async fn refresh_dataset_quality(
 	persist_quality_snapshot(state, dataset, &profile, score, &new_alerts).await?;
 	cleanup_temp_path(prepared.path).await;
 
-	fetch_dataset_quality(state, dataset.id).await
+	fetch_dataset_quality(state, dataset).await
 }
 
 pub async fn dataset_has_uploaded_data(state: &AppState, dataset: &Dataset) -> bool {
@@ -223,6 +239,7 @@ async fn persist_quality_snapshot(
 		})
 		.collect::<Vec<_>>();
 
+	let mut tx = tenant_tx(state, dataset.tenant_id).await?;
 	sqlx::query(
 		r#"INSERT INTO dataset_schemas (id, dataset_id, fields)
 		   VALUES ($1, $2, $3)
@@ -232,7 +249,7 @@ async fn persist_quality_snapshot(
 	.bind(Uuid::now_v7())
 	.bind(dataset.id)
 	.bind(serde_json::to_value(&schema_fields).map_err(|error| error.to_string())?)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -241,7 +258,7 @@ async fn persist_quality_snapshot(
 	)
 	.bind(dataset.id)
 	.bind(profile.row_count)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -275,7 +292,7 @@ async fn persist_quality_snapshot(
 		)
 		.map_err(|error| error.to_string())?,
 	)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -285,7 +302,7 @@ async fn persist_quality_snapshot(
 		"UPDATE dataset_quality_alerts SET status = 'resolved', resolved_at = NOW() WHERE dataset_id = $1 AND status = 'active'",
 	)
 	.bind(dataset.id)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -298,7 +315,7 @@ async fn persist_quality_snapshot(
 	.bind(passed_rules)
 	.bind(failed_rules)
 	.bind(new_alerts.len() as i32)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
@@ -312,11 +329,12 @@ async fn persist_quality_snapshot(
 		.bind(&alert.kind)
 		.bind(&alert.message)
 		.bind(&alert.details)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await
 		.map_err(|error| error.to_string())?;
 	}
 
+	tx.commit().await.map_err(|error| error.to_string())?;
 	Ok(())
 }
 
