@@ -3,8 +3,10 @@ use axum::{
 	http::{header::AUTHORIZATION, Method, StatusCode},
 	middleware::Next,
 	response::{IntoResponse, Response},
+	Json,
 };
 use auth_middleware::{jwt, JwtConfig};
+use serde_json::{json, Value};
 
 #[derive(Clone)]
 pub struct AccessState {
@@ -20,6 +22,7 @@ pub(crate) fn is_public_path(method: &Method, path: &str) -> bool {
 		(&Method::POST, "/api/v1/auth/register")
 		| (&Method::POST, "/api/v1/auth/login")
 		| (&Method::POST, "/api/v1/auth/refresh")
+		| (&Method::POST, "/api/v1/auth/refresh-token")
 		| (&Method::POST, "/api/v1/auth/mfa/complete")
 		| (&Method::GET, "/api/v1/auth/sso/providers/public")
 		| (&Method::POST, "/api/v1/auth/sso/callback") => true,
@@ -60,8 +63,12 @@ pub async fn require_auth_layer(
 	if allowed {
 		next.run(req).await
 	} else {
-		(StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+		(StatusCode::UNAUTHORIZED, Json(unauthorized_payload())).into_response()
 	}
+}
+
+pub(crate) fn unauthorized_payload() -> Value {
+	json!({ "error": "unauthorized" })
 }
 
 #[cfg(test)]
@@ -74,6 +81,7 @@ mod tests {
 		assert!(is_public_path(&Method::POST, "/api/v1/auth/login"));
 		assert!(is_public_path(&Method::POST, "/api/v1/auth/register"));
 		assert!(is_public_path(&Method::POST, "/api/v1/auth/refresh"));
+		assert!(is_public_path(&Method::POST, "/api/v1/auth/refresh-token"));
 		assert!(is_public_path(&Method::POST, "/api/v1/auth/mfa/complete"));
 		assert!(is_public_path(
 			&Method::GET,
@@ -108,5 +116,10 @@ mod tests {
 		assert!(is_access_token(None));
 		assert!(!is_access_token(Some("refresh")));
 		assert!(!is_access_token(Some("id")));
+	}
+
+	#[test]
+	fn unauthorized_payload_is_json_error() {
+		assert_eq!(unauthorized_payload()["error"], "unauthorized");
 	}
 }
