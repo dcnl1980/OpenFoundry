@@ -52,8 +52,9 @@ async fn main() {
         public_base_url: cfg.public_base_url.clone(),
     };
 
-    let public = Router::new()
-        .route("/health", get(|| async { "ok" }))
+    let public = Router::new().route("/health", get(|| async { "ok" }));
+
+    let protected = Router::new()
         .route(
             "/api/v1/apps/public/{slug}",
             get(handlers::preview::get_published_app),
@@ -61,9 +62,7 @@ async fn main() {
         .route(
             "/api/v1/apps/public/{slug}/embed",
             get(handlers::preview::get_embed_info),
-        );
-
-    let protected = Router::new()
+        )
         .route(
             "/api/v1/apps",
             get(handlers::apps::list_apps).post(handlers::apps::create_app),

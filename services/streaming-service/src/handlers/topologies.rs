@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 
+use auth_middleware::layer::AuthUser;
 use axum::{extract::Path, Json};
 use sqlx::types::Json as SqlJson;
 use uuid::Uuid;
 
 use crate::{
 	domain::{connectors, engine::processor},
-	handlers::{bad_request, db_error, not_found, ServiceResult},
+	handlers::{bad_request, db_error, not_found, scoped_tx, ServiceResult},
 	models::{
 		sink::{ConnectorCatalogEntry, LiveTailResponse},
 		stream::StreamRow,
 		topology::{
-			CreateTopologyRequest, TopologyDefinition, TopologyRow, TopologyRun,
-			TopologyRunRow, TopologyRuntimeSnapshot, UpdateTopologyRequest,
+			CreateTopologyRequest, TopologyDefinition, TopologyRow, TopologyRun, TopologyRunRow,
+			TopologyRuntimeSnapshot, UpdateTopologyRequest,
 		},
 		window::WindowRow,
 		ListResponse, StreamingOverview,
@@ -20,57 +21,50 @@ use crate::{
 	AppState,
 };
 
-async fn load_topology_row(db: &sqlx::PgPool, id: Uuid) -> Result<TopologyRow, sqlx::Error> {
-	sqlx::query_as::<_, TopologyRow>(
-		"SELECT id, name, description, status, nodes, edges, join_definition, cep_definition,
-		        backpressure_policy, source_stream_ids, sink_bindings, state_backend,
-		        created_at, updated_at
-		 FROM streaming_topologies
-		 WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_one(db)
-	.await
+async fn load_topology_row(
+	tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+	id: Uuid,
+) -> Result<TopologyRow, sqlx::Error> {
+	sqlx::query_as::<_, TopologyRow>("SELECT * FROM streaming_topologies WHERE id = $1")
+		.bind(id)
+		.fetch_one(&mut **tx)
+		.await
 }
 
 async fn load_latest_run_row(
-	db: &sqlx::PgPool,
+	tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 	topology_id: Uuid,
 ) -> Result<Option<TopologyRunRow>, sqlx::Error> {
 	sqlx::query_as::<_, TopologyRunRow>(
-		"SELECT id, topology_id, status, metrics, aggregate_windows, live_tail, cep_matches,
-		        state_snapshot, backpressure_snapshot, started_at, completed_at, created_at, updated_at
-		 FROM streaming_topology_runs
+		"SELECT * FROM streaming_topology_runs
 		 WHERE topology_id = $1
 		 ORDER BY created_at DESC
 		 LIMIT 1",
 	)
 	.bind(topology_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut **tx)
 	.await
 }
 
-async fn load_all_streams(db: &sqlx::PgPool) -> Result<Vec<crate::models::stream::StreamDefinition>, sqlx::Error> {
+async fn load_all_streams(
+	tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<crate::models::stream::StreamDefinition>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, StreamRow>(
-		"SELECT id, name, description, status, schema, source_binding, retention_hours, created_at, updated_at
-		 FROM streaming_streams
-		 ORDER BY created_at ASC",
+		"SELECT * FROM streaming_streams ORDER BY created_at ASC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut **tx)
 	.await?;
 
 	Ok(rows.into_iter().map(Into::into).collect())
 }
 
-async fn load_all_windows(db: &sqlx::PgPool) -> Result<Vec<crate::models::window::WindowDefinition>, sqlx::Error> {
+async fn load_all_windows(
+	tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<crate::models::window::WindowDefinition>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, WindowRow>(
-		"SELECT id, name, description, status, window_type, duration_seconds, slide_seconds,
-		        session_gap_seconds, allowed_lateness_seconds, aggregation_keys, measure_fields,
-		        created_at, updated_at
-		 FROM streaming_windows
-		 ORDER BY created_at ASC",
+		"SELECT * FROM streaming_windows ORDER BY created_at ASC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut **tx)
 	.await?;
 
 	Ok(rows.into_iter().map(Into::into).collect())
@@ -78,39 +72,31 @@ async fn load_all_windows(db: &sqlx::PgPool) -> Result<Vec<crate::models::window
 
 pub async fn get_overview(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<StreamingOverview> {
-	let stream_rows = sqlx::query_as::<_, StreamRow>(
-		"SELECT id, name, description, status, schema, source_binding, retention_hours, created_at, updated_at
-		 FROM streaming_streams",
-	)
-	.fetch_all(&state.db)
-	.await
-	.map_err(|cause| db_error(&cause))?;
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let stream_rows = sqlx::query_as::<_, StreamRow>("SELECT * FROM streaming_streams")
+		.fetch_all(&mut *tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
 
-	let topology_rows = sqlx::query_as::<_, TopologyRow>(
-		"SELECT id, name, description, status, nodes, edges, join_definition, cep_definition,
-		        backpressure_policy, source_stream_ids, sink_bindings, state_backend,
-		        created_at, updated_at
-		 FROM streaming_topologies",
-	)
-	.fetch_all(&state.db)
-	.await
-	.map_err(|cause| db_error(&cause))?;
+	let topology_rows = sqlx::query_as::<_, TopologyRow>("SELECT * FROM streaming_topologies")
+		.fetch_all(&mut *tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
 
 	let window_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM streaming_windows")
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 
 	let run_rows = sqlx::query_as::<_, TopologyRunRow>(
-		"SELECT id, topology_id, status, metrics, aggregate_windows, live_tail, cep_matches,
-		        state_snapshot, backpressure_snapshot, started_at, completed_at, created_at, updated_at
-		 FROM streaming_topology_runs
-		 ORDER BY created_at DESC",
+		"SELECT * FROM streaming_topology_runs ORDER BY created_at DESC",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	let connector_count = stream_rows.len()
 		+ topology_rows
@@ -156,17 +142,16 @@ pub async fn get_overview(
 
 pub async fn list_topologies(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<TopologyDefinition>> {
+	let mut tx = scoped_tx(&state, &claims).await?;
 	let rows = sqlx::query_as::<_, TopologyRow>(
-		"SELECT id, name, description, status, nodes, edges, join_definition, cep_definition,
-		        backpressure_policy, source_stream_ids, sink_bindings, state_backend,
-		        created_at, updated_at
-		 FROM streaming_topologies
-		 ORDER BY created_at ASC",
+		"SELECT * FROM streaming_topologies ORDER BY created_at ASC",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListResponse {
 		data: rows.into_iter().map(Into::into).collect(),
@@ -175,6 +160,7 @@ pub async fn list_topologies(
 
 pub async fn create_topology(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(payload): Json<CreateTopologyRequest>,
 ) -> ServiceResult<TopologyDefinition> {
 	if payload.name.trim().is_empty() {
@@ -184,13 +170,14 @@ pub async fn create_topology(
 		return Err(bad_request("at least one source stream is required"));
 	}
 
+	let mut tx = scoped_tx(&state, &claims).await?;
 	let topology_id = Uuid::now_v7();
 
 	sqlx::query(
 		"INSERT INTO streaming_topologies (
 		    id, name, description, status, nodes, edges, join_definition, cep_definition,
-		    backpressure_policy, source_stream_ids, sink_bindings, state_backend
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+		    backpressure_policy, source_stream_ids, sink_bindings, state_backend, tenant_id
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
 	)
 	.bind(topology_id)
 	.bind(payload.name.trim())
@@ -204,23 +191,27 @@ pub async fn create_topology(
 	.bind(SqlJson(payload.source_stream_ids))
 	.bind(SqlJson(payload.sink_bindings))
 	.bind(payload.state_backend.unwrap_or_else(|| "rocksdb".to_string()))
-	.execute(&state.db)
+	.bind(claims.tenant_scope_id())
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_topology_row(&state.db, topology_id)
+	let row = load_topology_row(&mut tx, topology_id)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn update_topology(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(id): Path<Uuid>,
 	Json(payload): Json<UpdateTopologyRequest>,
 ) -> ServiceResult<TopologyDefinition> {
-	let existing = match load_topology_row(&state.db, id).await {
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let existing = match load_topology_row(&mut tx, id).await {
 		Ok(row) => row,
 		Err(sqlx::Error::RowNotFound) => return Err(not_found("topology not found")),
 		Err(cause) => return Err(db_error(&cause)),
@@ -262,38 +253,41 @@ pub async fn update_topology(
 	))
 	.bind(SqlJson(payload.sink_bindings.unwrap_or(existing.sink_bindings.0)))
 	.bind(payload.state_backend.unwrap_or(existing.state_backend))
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_topology_row(&state.db, id)
+	let row = load_topology_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn run_topology(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(id): Path<Uuid>,
 ) -> ServiceResult<TopologyRun> {
-	let topology = match load_topology_row(&state.db, id).await {
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let topology = match load_topology_row(&mut tx, id).await {
 		Ok(row) => TopologyDefinition::from(row),
 		Err(sqlx::Error::RowNotFound) => return Err(not_found("topology not found")),
 		Err(cause) => return Err(db_error(&cause)),
 	};
 
-	let streams = load_all_streams(&state.db)
+	let streams = load_all_streams(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
-	let windows = load_all_windows(&state.db)
+	let windows = load_all_windows(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let previous_runs = sqlx::query_scalar::<_, i64>(
 		"SELECT COUNT(*) FROM streaming_topology_runs WHERE topology_id = $1",
 	)
 	.bind(id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))? as usize;
 
@@ -303,8 +297,8 @@ pub async fn run_topology(
 	sqlx::query(
 		"INSERT INTO streaming_topology_runs (
 		    id, topology_id, status, metrics, aggregate_windows, live_tail, cep_matches,
-		    state_snapshot, backpressure_snapshot, started_at, completed_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+		    state_snapshot, backpressure_snapshot, started_at, completed_at, tenant_id
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
 	)
 	.bind(run_id)
 	.bind(id)
@@ -317,35 +311,40 @@ pub async fn run_topology(
 	.bind(SqlJson(execution.backpressure_snapshot))
 	.bind(execution.started_at)
 	.bind(execution.completed_at)
-	.execute(&state.db)
+	.bind(claims.tenant_scope_id())
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_latest_run_row(&state.db, id)
+	let row = load_latest_run_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("topology run not found after execution"))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn get_runtime(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(id): Path<Uuid>,
 ) -> ServiceResult<TopologyRuntimeSnapshot> {
-	let topology = match load_topology_row(&state.db, id).await {
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let topology = match load_topology_row(&mut tx, id).await {
 		Ok(row) => TopologyDefinition::from(row),
 		Err(sqlx::Error::RowNotFound) => return Err(not_found("topology not found")),
 		Err(cause) => return Err(db_error(&cause)),
 	};
 
-	let streams = load_all_streams(&state.db)
+	let streams = load_all_streams(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let connector_statuses = connectors::catalog_entries(&topology, &streams);
-	let latest_run = load_latest_run_row(&state.db, id)
+	let latest_run = load_latest_run_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	let latest_events = latest_run
 		.as_ref()
 		.map(|row| row.live_tail.0.clone())
@@ -366,20 +365,19 @@ pub async fn get_runtime(
 
 pub async fn list_connectors(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<ConnectorCatalogEntry>> {
-	let streams = load_all_streams(&state.db)
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let streams = load_all_streams(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let topologies = sqlx::query_as::<_, TopologyRow>(
-		"SELECT id, name, description, status, nodes, edges, join_definition, cep_definition,
-		        backpressure_policy, source_stream_ids, sink_bindings, state_backend,
-		        created_at, updated_at
-		 FROM streaming_topologies
-		 ORDER BY created_at ASC",
+		"SELECT * FROM streaming_topologies ORDER BY created_at ASC",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	let mut entries = Vec::new();
 	for topology in topologies.into_iter().map(TopologyDefinition::from) {
@@ -391,31 +389,26 @@ pub async fn list_connectors(
 
 pub async fn get_live_tail(
 	axum::extract::State(state): axum::extract::State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<LiveTailResponse> {
-	let streams = load_all_streams(&state.db)
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let streams = load_all_streams(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	let topologies = sqlx::query_as::<_, TopologyRow>(
-		"SELECT id, name, description, status, nodes, edges, join_definition, cep_definition,
-		        backpressure_policy, source_stream_ids, sink_bindings, state_backend,
-		        created_at, updated_at
-		 FROM streaming_topologies
-		 ORDER BY created_at ASC",
+		"SELECT * FROM streaming_topologies ORDER BY created_at ASC",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
 	let run_rows = sqlx::query_as::<_, TopologyRunRow>(
-		"SELECT id, topology_id, status, metrics, aggregate_windows, live_tail, cep_matches,
-		        state_snapshot, backpressure_snapshot, started_at, completed_at, created_at, updated_at
-		 FROM streaming_topology_runs
-		 ORDER BY created_at DESC
-		 LIMIT 8",
+		"SELECT * FROM streaming_topology_runs ORDER BY created_at DESC LIMIT 8",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	let mut events = Vec::new();
 	let mut matches = Vec::new();

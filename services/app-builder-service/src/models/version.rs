@@ -50,6 +50,8 @@ pub(crate) struct AppVersionRow {
 	pub app_snapshot: Json<AppSnapshot>,
 	pub notes: String,
 	pub created_by: Option<Uuid>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub published_at: Option<DateTime<Utc>>,
 }

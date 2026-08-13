@@ -1,9 +1,16 @@
-use axum::{extract::{Path, State}, Json};
+use auth_middleware::layer::AuthUser;
+use axum::{
+	extract::{Path, State},
+	Json,
+};
 use chrono::Utc;
 
 use crate::{
 	domain::indexer,
-	handlers::{bad_request, db_error, internal_error, load_all_layers, load_layer_row, not_found, ServiceResult},
+	handlers::{
+		bad_request, db_error, internal_error, load_all_layers, load_layer_row, not_found, scoped_tx,
+		ServiceResult,
+	},
 	models::{
 		layer::{CreateLayerRequest, LayerDefinition, UpdateLayerRequest},
 		spatial_index::GeospatialOverview,
@@ -12,18 +19,33 @@ use crate::{
 	AppState,
 };
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<GeospatialOverview> {
-	let layers = load_all_layers(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<GeospatialOverview> {
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let layers = load_all_layers(&mut tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(indexer::build_overview(&layers)))
 }
 
-pub async fn list_layers(State(state): State<AppState>) -> ServiceResult<ListResponse<LayerDefinition>> {
-	let layers = load_all_layers(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_layers(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<LayerDefinition>> {
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let layers = load_all_layers(&mut tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(ListResponse { items: layers }))
 }
 
 pub async fn create_layer(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateLayerRequest>,
 ) -> ServiceResult<LayerDefinition> {
 	if request.name.trim().is_empty() {
@@ -33,6 +55,7 @@ pub async fn create_layer(
 		return Err(bad_request("layer requires at least one feature"));
 	}
 
+	let mut tx = scoped_tx(&state, &claims).await?;
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let style = serde_json::to_value(&request.style).map_err(|cause| internal_error(cause.to_string()))?;
@@ -40,8 +63,8 @@ pub async fn create_layer(
 	let tags = serde_json::to_value(&request.tags).map_err(|cause| internal_error(cause.to_string()))?;
 
 	sqlx::query(
-		"INSERT INTO geospatial_layers (id, name, description, source_kind, source_dataset, geometry_type, style, features, tags, indexed, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12)",
+		"INSERT INTO geospatial_layers (id, name, description, source_kind, source_dataset, geometry_type, style, features, tags, indexed, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13)",
 	)
 	.bind(id)
 	.bind(request.name)
@@ -55,14 +78,16 @@ pub async fn create_layer(
 	.bind(request.indexed)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(claims.tenant_scope_id())
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_layer_row(&state.db, id)
+	let row = load_layer_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created layer could not be reloaded"))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	let layer = LayerDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(layer))
 }
@@ -70,9 +95,11 @@ pub async fn create_layer(
 pub async fn update_layer(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateLayerRequest>,
 ) -> ServiceResult<LayerDefinition> {
-	let existing = load_layer_row(&state.db, id)
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let existing = load_layer_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("layer not found"))?;
@@ -142,14 +169,15 @@ pub async fn update_layer(
 	.bind(tags)
 	.bind(layer.indexed)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_layer_row(&state.db, id)
+	let row = load_layer_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated layer could not be reloaded"))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	let layer = LayerDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(layer))
 }

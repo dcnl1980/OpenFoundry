@@ -1,12 +1,15 @@
 pub mod features;
 pub mod geocode;
 pub mod layers;
+pub mod tenant;
 pub mod tiles;
 
+use auth_middleware::Claims;
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
+use sqlx::{Postgres, Transaction};
 
-use crate::models::layer::LayerRow;
+use crate::{models::layer::LayerRow, AppState};
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
@@ -47,29 +50,32 @@ pub fn db_error(cause: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
 	internal_error("database operation failed")
 }
 
+pub async fn scoped_tx<'a>(
+	state: &'a AppState,
+	claims: &Claims,
+) -> Result<Transaction<'a, Postgres>, (StatusCode, Json<ErrorResponse>)> {
+	tenant::begin_scope(state, claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))
+}
+
 pub async fn load_layer_row(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 	id: uuid::Uuid,
 ) -> Result<Option<LayerRow>, sqlx::Error> {
-	sqlx::query_as::<_, LayerRow>(
-		"SELECT id, name, description, source_kind, source_dataset, geometry_type, style, features, tags, indexed, created_at, updated_at
-		 FROM geospatial_layers
-		 WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_optional(db)
-	.await
+	sqlx::query_as::<_, LayerRow>("SELECT * FROM geospatial_layers WHERE id = $1")
+		.bind(id)
+		.fetch_optional(&mut **tx)
+		.await
 }
 
 pub async fn load_all_layers(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<crate::models::layer::LayerDefinition>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, LayerRow>(
-		"SELECT id, name, description, source_kind, source_dataset, geometry_type, style, features, tags, indexed, created_at, updated_at
-		 FROM geospatial_layers
-		 ORDER BY updated_at DESC",
+		"SELECT * FROM geospatial_layers ORDER BY updated_at DESC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut **tx)
 	.await?;
 
 	rows.into_iter()

@@ -100,6 +100,8 @@ pub struct LayerRow {
 	pub features: Value,
 	pub tags: Value,
 	pub indexed: bool,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }

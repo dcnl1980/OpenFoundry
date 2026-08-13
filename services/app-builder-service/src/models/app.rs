@@ -222,6 +222,8 @@ pub(crate) struct AppRow {
 	pub template_key: Option<String>,
 	pub created_by: Option<Uuid>,
 	pub published_version_id: Option<Uuid>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }
