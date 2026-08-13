@@ -48,6 +48,7 @@
 		type ToolDefinition,
 	} from '$lib/api/ai';
 	import { notifications } from '$stores/notifications';
+	import { applyProviderPreset, PROVIDER_PRESET_IDS, providerPreset } from '$lib/ai/provider-presets';
 	import { copilot } from '$stores/copilot';
 
 	type ProviderDraft = {
@@ -185,18 +186,15 @@
 	});
 
 	function createEmptyProviderDraft(): ProviderDraft {
+		const preset = providerPreset('openrouter');
 		return {
-			name: 'OpenAI Primary',
-			provider_type: 'openai',
-			model_name: 'gpt-4.1-mini',
-			endpoint_url: 'https://api.openai.com/v1',
-			api_mode: 'chat_completions',
-			credential_reference: 'OPENAI_API_KEY',
+			name: 'OpenRouter',
+			...preset,
 			enabled: true,
-			load_balance_weight: 100,
+			load_balance_weight: 130,
 			max_output_tokens: 2048,
 			cost_tier: 'standard',
-			tags_text: 'production, chat',
+			tags_text: 'production, chat, copilot',
 			use_cases_text: 'chat, copilot, general',
 		};
 	}
@@ -713,8 +711,21 @@
 				</div>
 				<div class="mt-4 grid gap-3 md:grid-cols-2">
 					<input class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-200 outline-none" value={providerDraft.name} oninput={(event) => providerDraft = { ...providerDraft, name: (event.currentTarget as HTMLInputElement).value }} placeholder="Provider name" />
+					<select
+						class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white outline-none"
+						value={providerDraft.provider_type}
+						onchange={(event) => {
+							const nextType = (event.currentTarget as HTMLSelectElement).value;
+							providerDraft = applyProviderPreset(providerDraft, nextType);
+						}}
+					>
+						{#each PROVIDER_PRESET_IDS as presetId}
+							<option value={presetId}>{presetId}</option>
+						{/each}
+					</select>
 					<input class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-200 outline-none" value={providerDraft.model_name} oninput={(event) => providerDraft = { ...providerDraft, model_name: (event.currentTarget as HTMLInputElement).value }} placeholder="Model" />
 					<input class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-200 outline-none" value={providerDraft.endpoint_url} oninput={(event) => providerDraft = { ...providerDraft, endpoint_url: (event.currentTarget as HTMLInputElement).value }} placeholder="Endpoint" />
+					<input class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-200 outline-none" value={providerDraft.credential_reference} oninput={(event) => providerDraft = { ...providerDraft, credential_reference: (event.currentTarget as HTMLInputElement).value }} placeholder="OPENROUTER_API_KEY" />
 					<input class="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 text-sm text-white placeholder:text-slate-200 outline-none" value={providerDraft.use_cases_text} oninput={(event) => providerDraft = { ...providerDraft, use_cases_text: (event.currentTarget as HTMLInputElement).value }} placeholder="chat, copilot" />
 				</div>
 				<div class="mt-3 grid gap-3 md:grid-cols-2">

@@ -1,0 +1,31 @@
+INSERT INTO ai_providers (
+    id,
+    name,
+    provider_type,
+    model_name,
+    endpoint_url,
+    api_mode,
+    credential_reference,
+    enabled,
+    load_balance_weight,
+    max_output_tokens,
+    cost_tier,
+    tags,
+    route_rules,
+    health_state
+) VALUES (
+    '01967f76-3550-70c0-9000-000000000004',
+    'OpenRouter',
+    'openrouter',
+    'openai/gpt-4o-mini',
+    'https://openrouter.ai/api/v1',
+    'chat_completions',
+    'OPENROUTER_API_KEY',
+    TRUE,
+    130,
+    2048,
+    'standard',
+    '["production", "chat", "copilot"]'::jsonb,
+    '{"use_cases":["chat","copilot","general"],"preferred_regions":[],"fallback_provider_ids":["01967f76-3550-70c0-9000-000000000001","01967f76-3550-70c0-9000-000000000002"],"weight":130,"max_context_tokens":128000}'::jsonb,
+    '{"status":"healthy","avg_latency_ms":480,"error_rate":0.01,"last_checked_at":"2026-08-13T22:00:00Z"}'::jsonb
+) ON CONFLICT (id) DO NOTHING;

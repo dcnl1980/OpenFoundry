@@ -65,6 +65,21 @@ pub fn build_completion_request(
 			}),
 			Vec::new(),
 		),
+		("openrouter", _) => (
+			join_endpoint(&provider.endpoint_url, "chat/completions"),
+			json!({
+				"model": provider.model_name,
+				"max_tokens": provider.max_output_tokens.max(1),
+				"messages": [
+					{ "role": "system", "content": "You are the OpenFoundry platform copilot." },
+					{ "role": "user", "content": prompt }
+				],
+			}),
+			vec![
+				("http-referer".to_string(), "https://github.com/dcnl1980/OpenFoundry".to_string()),
+				("x-title".to_string(), "OpenFoundry".to_string()),
+			],
+		),
 		_ => (
 			join_endpoint(&provider.endpoint_url, "chat/completions"),
 			json!({
@@ -218,6 +233,31 @@ mod tests {
 	}
 
 	#[test]
+	fn build_openrouter_chat_completion_request() {
+		let request = build_completion_request(
+			&provider("openrouter", "chat_completions", "https://openrouter.ai/api/v1"),
+			"Reply with pong.",
+			Some("sk-or-v1-test"),
+		)
+		.expect("request should build");
+
+		assert_eq!(request.url, "https://openrouter.ai/api/v1/chat/completions");
+		assert!(request
+			.headers
+			.iter()
+			.any(|(key, value)| key == "authorization" && value == "Bearer sk-or-v1-test"));
+		assert!(request
+			.headers
+			.iter()
+			.any(|(key, _)| key == "http-referer"));
+		assert!(request
+			.headers
+			.iter()
+			.any(|(key, value)| key == "x-title" && value == "OpenFoundry"));
+		assert_eq!(request.body["model"], "gpt-test");
+	}
+
+	#[test]
 	fn parse_openai_and_anthropic_envelopes() {
 		let openai = json!({
 			"choices": [{ "message": { "content": "TP53 encodes p53." } }]
@@ -234,5 +274,33 @@ mod tests {
 			parse_completion_response("anthropic", "messages", &anthropic).unwrap(),
 			"TP53 encodes p53."
 		);
+	}
+
+	#[tokio::test]
+	async fn live_openrouter_completion() {
+		let Ok(key) = std::env::var("OPENROUTER_API_KEY") else {
+			return;
+		};
+		if key.trim().is_empty() {
+			return;
+		}
+
+		let mut live = provider(
+			"openrouter",
+			"chat_completions",
+			"https://openrouter.ai/api/v1",
+		);
+		live.model_name = "openai/gpt-4o-mini".into();
+		live.credential_reference = Some("OPENROUTER_API_KEY".into());
+		live.max_output_tokens = 32;
+
+		let client = reqwest::Client::builder()
+			.timeout(std::time::Duration::from_secs(30))
+			.build()
+			.expect("http client");
+		let answer = complete(&client, &live, "Reply with the single word pong.")
+			.await
+			.expect("OpenRouter completion should succeed");
+		assert!(!answer.trim().is_empty(), "OpenRouter returned an empty answer");
 	}
 }
