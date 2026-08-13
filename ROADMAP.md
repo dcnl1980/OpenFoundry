@@ -332,7 +332,7 @@ Current repo audit: 24 of 25 Foundry-shaped components have a crate and/or UI ro
 - [x] **Global CDN** — Tile server and static asset caching at the edge
 - [x] **Benchmark suite** — Reproducible benchmarks for all critical paths
 
-**Phase 5 exit criteria:**
+**Phase 5 exit criteria (target, not current state):**
 > Organizations can share data securely across boundaries, third-party developers can extend the platform, and the system scales to enterprise workloads.
 
 ---

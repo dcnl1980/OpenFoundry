@@ -2529,6 +2529,7 @@ dependencies = [
  "config",
  "core-models",
  "event-bus",
+ "futures",
  "hyper",
  "reqwest",
  "serde",
