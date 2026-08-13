@@ -1,5 +1,43 @@
 use serde_json::Value;
 
+use crate::models::property::CreatePropertyRequest;
+
+pub struct PreparedProperty {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub property_type: String,
+    pub required: bool,
+    pub unique_constraint: bool,
+    pub default_value: Option<Value>,
+    pub validation_rules: Option<Value>,
+}
+
+pub fn prepare_new_property(body: &CreatePropertyRequest) -> Result<PreparedProperty, String> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err("name is required".into());
+    }
+    validate_property_type(&body.property_type)?;
+
+    Ok(PreparedProperty {
+        name: name.to_string(),
+        display_name: body
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(name)
+            .to_string(),
+        description: body.description.clone().unwrap_or_default(),
+        property_type: body.property_type.clone(),
+        required: body.required.unwrap_or(false),
+        unique_constraint: body.unique_constraint.unwrap_or(false),
+        default_value: body.default_value.clone(),
+        validation_rules: body.validation_rules.clone(),
+    })
+}
+
 const VALID_TYPES: &[&str] = &[
     "string", "integer", "float", "boolean", "date", "timestamp", "json", "array", "reference",
 ];
@@ -43,5 +81,64 @@ pub fn validate_cardinality(cardinality: &str) -> Result<(), String> {
     match cardinality {
         "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many" => Ok(()),
         _ => Err(format!("invalid cardinality '{cardinality}', valid: one_to_one, one_to_many, many_to_one, many_to_many")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_new_property_rejects_blank_name() {
+        let err = prepare_new_property(&CreatePropertyRequest {
+            name: "   ".into(),
+            display_name: None,
+            description: None,
+            property_type: "string".into(),
+            required: None,
+            unique_constraint: None,
+            default_value: None,
+            validation_rules: None,
+        })
+        .expect_err("blank names must be rejected");
+
+        assert!(err.contains("name"));
+    }
+
+    #[test]
+    fn prepare_new_property_rejects_unknown_type() {
+        let err = prepare_new_property(&CreatePropertyRequest {
+            name: "status".into(),
+            display_name: None,
+            description: None,
+            property_type: "uuid".into(),
+            required: None,
+            unique_constraint: None,
+            default_value: None,
+            validation_rules: None,
+        })
+        .expect_err("unknown property types must be rejected");
+
+        assert!(err.contains("invalid property type"));
+    }
+
+    #[test]
+    fn prepare_new_property_defaults_display_name() {
+        let prepared = prepare_new_property(&CreatePropertyRequest {
+            name: "status".into(),
+            display_name: None,
+            description: None,
+            property_type: "string".into(),
+            required: Some(true),
+            unique_constraint: None,
+            default_value: None,
+            validation_rules: None,
+        })
+        .expect("valid property should prepare");
+
+        assert_eq!(prepared.name, "status");
+        assert_eq!(prepared.display_name, "status");
+        assert!(prepared.required);
+        assert!(!prepared.unique_constraint);
     }
 }

@@ -66,6 +66,10 @@ async fn main() {
         .route("/api/v1/ontology/types/{id}", get(handlers::types::get_object_type))
         .route("/api/v1/ontology/types/{id}", put(handlers::types::update_object_type))
         .route("/api/v1/ontology/types/{id}", delete(handlers::types::delete_object_type))
+        .route(
+            "/api/v1/ontology/types/{type_id}/properties",
+            get(handlers::properties::list_properties).post(handlers::properties::create_property),
+        )
         // Action types
         .route("/api/v1/ontology/actions", post(handlers::actions::create_action_type))
         .route("/api/v1/ontology/actions", get(handlers::actions::list_action_types))
