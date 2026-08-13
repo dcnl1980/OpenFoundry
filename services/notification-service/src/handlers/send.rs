@@ -25,7 +25,10 @@ pub async fn internal_send_notification(
 	State(state): State<AppState>,
 	Json(body): Json<SendNotificationRequest>,
 ) -> impl IntoResponse {
-	let tenant_id = body.user_id.unwrap_or(PLACEHOLDER_TENANT);
+	let tenant_id = body
+		.tenant_id
+		.or(body.user_id)
+		.unwrap_or(PLACEHOLDER_TENANT);
 	match create_notification(&state, tenant_id, body).await {
 		Ok(notification) => (StatusCode::CREATED, Json(notification)).into_response(),
 		Err(error) => (

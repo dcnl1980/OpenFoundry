@@ -42,6 +42,7 @@ pub struct NotificationEvent {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SendNotificationRequest {
 	pub user_id: Option<Uuid>,
+	pub tenant_id: Option<Uuid>,
 	pub title: String,
 	pub body: String,
 	pub severity: Option<String>,
