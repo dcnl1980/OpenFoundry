@@ -12,8 +12,9 @@ use crate::{
     },
     AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, deserialize_json, to_json, ServiceResult};
+use super::{bad_request, db_error, deserialize_json, tenant::begin_scope, to_json, ServiceResult};
 
 #[derive(Debug, FromRow)]
 struct TrainingJobRow {
@@ -92,7 +93,9 @@ fn _to_model_version(row: ModelVersionRow) -> ModelVersion {
 
 pub async fn list_training_jobs(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListTrainingJobsResponse> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, TrainingJobRow>(
         r#"
         SELECT
@@ -115,9 +118,10 @@ pub async fn list_training_jobs(
         ORDER BY submitted_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListTrainingJobsResponse {
         data: rows.into_iter().map(to_training_job).collect(),
@@ -126,12 +130,15 @@ pub async fn list_training_jobs(
 
 pub async fn create_training_job(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Json(body): Json<CreateTrainingJobRequest>,
 ) -> ServiceResult<TrainingJob> {
     if body.name.trim().is_empty() {
         return Err(bad_request("training job name is required"));
     }
 
+    let mut tx = begin_scope(&state, &claims).await?;
+    let tenant_id = claims.tenant_scope_id();
     let objective_metric_name = body
         .objective_metric_name
         .unwrap_or_else(|| "accuracy".to_string());
@@ -149,7 +156,7 @@ pub async fn create_training_job(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 FROM ml_model_versions WHERE model_id = $1",
             )
             .bind(model_id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|cause| db_error(&cause))?;
 
@@ -167,9 +174,10 @@ pub async fn create_training_job(
                     metrics,
                     artifact_uri,
                     schema,
-                    promoted_at
+                    promoted_at,
+                    tenant_id
                 )
-                VALUES ($1, $2, $3, $4, 'candidate', NULL, $5, $6, $7, $8, $9, NULL)
+                VALUES ($1, $2, $3, $4, 'candidate', NULL, $5, $6, $7, $8, $9, NULL, $10)
                 RETURNING
                     id,
                     model_id,
@@ -199,7 +207,8 @@ pub async fn create_training_job(
                 "objective_metric": objective_metric_name,
                 "generated_by": "training-orchestrator"
             }))
-            .fetch_one(&state.db)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|cause| db_error(&cause))?;
 
@@ -210,7 +219,7 @@ pub async fn create_training_job(
             )
             .bind(model_id)
             .bind(next_version_number)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await
             .map_err(|cause| db_error(&cause))?;
         }
@@ -233,9 +242,10 @@ pub async fn create_training_job(
             submitted_at,
             started_at,
             completed_at,
-            created_at
+            created_at,
+            tenant_id
         )
-        VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING
             id,
             experiment_id,
@@ -272,9 +282,11 @@ pub async fn create_training_job(
     .bind(Some(now))
     .bind(Some(now))
     .bind(now)
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(to_training_job(row)))
 }

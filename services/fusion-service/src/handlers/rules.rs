@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use sqlx::{query_as, types::Json as SqlJson};
+use sqlx::{query_as, types::Json as SqlJson, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -18,11 +18,12 @@ use crate::{
     },
     AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, not_found, ServiceResult};
+use super::{bad_request, db_error, not_found, tenant::begin_scope, ServiceResult};
 
 async fn load_rule_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     rule_id: Uuid,
 ) -> Result<Option<MatchRuleRow>, sqlx::Error> {
     query_as::<_, MatchRuleRow>(
@@ -44,12 +45,12 @@ async fn load_rule_row(
         "#,
     )
     .bind(rule_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 async fn load_merge_strategy_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     strategy_id: Uuid,
 ) -> Result<Option<MergeStrategyRow>, sqlx::Error> {
     query_as::<_, MergeStrategyRow>(
@@ -69,11 +70,15 @@ async fn load_merge_strategy_row(
         "#,
     )
     .bind(strategy_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
-pub async fn list_rules(State(state): State<AppState>) -> ServiceResult<ListResponse<MatchRule>> {
+pub async fn list_rules(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<MatchRule>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, MatchRuleRow>(
         r#"
         SELECT
@@ -92,9 +97,10 @@ pub async fn list_rules(State(state): State<AppState>) -> ServiceResult<ListResp
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -103,12 +109,15 @@ pub async fn list_rules(State(state): State<AppState>) -> ServiceResult<ListResp
 
 pub async fn create_rule(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Json(body): Json<CreateMatchRuleRequest>,
 ) -> ServiceResult<MatchRule> {
     if body.name.trim().is_empty() || body.conditions.is_empty() {
         return Err(bad_request("rule name and at least one condition are required"));
     }
 
+    let mut tx = begin_scope(&state, &claims).await?;
+    let tenant_id = claims.tenant_scope_id();
     let row = query_as::<_, MatchRuleRow>(
         r#"
         INSERT INTO fusion_match_rules (
@@ -120,9 +129,10 @@ pub async fn create_rule(
             blocking_strategy,
             conditions,
             review_threshold,
-            auto_merge_threshold
+            auto_merge_threshold,
+            tenant_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING
             id,
             name,
@@ -146,19 +156,23 @@ pub async fn create_rule(
     .bind(SqlJson(body.conditions))
     .bind(body.review_threshold.unwrap_or(0.76))
     .bind(body.auto_merge_threshold.unwrap_or(0.9))
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(row.into()))
 }
 
 pub async fn update_rule(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(rule_id): Path<Uuid>,
     Json(body): Json<UpdateMatchRuleRequest>,
 ) -> ServiceResult<MatchRule> {
-    let Some(current) = load_rule_row(&state.db, rule_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let Some(current) = load_rule_row(&mut tx, rule_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
@@ -202,16 +216,19 @@ pub async fn update_rule(
     .bind(SqlJson(body.conditions.unwrap_or(rule.conditions)))
     .bind(body.review_threshold.unwrap_or(rule.review_threshold))
     .bind(body.auto_merge_threshold.unwrap_or(rule.auto_merge_threshold))
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(row.into()))
 }
 
 pub async fn list_merge_strategies(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<MergeStrategy>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, MergeStrategyRow>(
         r#"
         SELECT
@@ -228,9 +245,10 @@ pub async fn list_merge_strategies(
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -239,12 +257,15 @@ pub async fn list_merge_strategies(
 
 pub async fn create_merge_strategy(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Json(body): Json<CreateMergeStrategyRequest>,
 ) -> ServiceResult<MergeStrategy> {
     if body.name.trim().is_empty() {
         return Err(bad_request("merge strategy name is required"));
     }
 
+    let mut tx = begin_scope(&state, &claims).await?;
+    let tenant_id = claims.tenant_scope_id();
     let row = query_as::<_, MergeStrategyRow>(
         r#"
         INSERT INTO fusion_merge_strategies (
@@ -254,9 +275,10 @@ pub async fn create_merge_strategy(
             status,
             entity_type,
             default_strategy,
-            rules
+            rules,
+            tenant_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING
             id,
             name,
@@ -276,19 +298,23 @@ pub async fn create_merge_strategy(
     .bind(body.entity_type.unwrap_or_else(|| "person".to_string()))
     .bind(body.default_strategy.unwrap_or_else(|| "longest_non_empty".to_string()))
     .bind(SqlJson(body.rules))
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(row.into()))
 }
 
 pub async fn update_merge_strategy(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(strategy_id): Path<Uuid>,
     Json(body): Json<UpdateMergeStrategyRequest>,
 ) -> ServiceResult<MergeStrategy> {
-    let Some(current) = load_merge_strategy_row(&state.db, strategy_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let Some(current) = load_merge_strategy_row(&mut tx, strategy_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
@@ -326,9 +352,10 @@ pub async fn update_merge_strategy(
     .bind(body.entity_type.unwrap_or(strategy.entity_type))
     .bind(body.default_strategy.unwrap_or(strategy.default_strategy))
     .bind(SqlJson(body.rules.unwrap_or(strategy.rules)))
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(row.into()))
 }

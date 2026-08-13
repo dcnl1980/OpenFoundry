@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use sqlx::{query_as, types::Json as SqlJson};
+use sqlx::{query_as, types::Json as SqlJson, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -17,11 +17,12 @@ use crate::{
     },
     AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{db_error, not_found, ServiceResult};
+use super::{db_error, not_found, tenant::begin_scope, ServiceResult};
 
 async fn load_cluster_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     cluster_id: Uuid,
 ) -> Result<Option<ClusterRow>, sqlx::Error> {
     query_as::<_, ClusterRow>(
@@ -43,12 +44,12 @@ async fn load_cluster_row(
         "#,
     )
     .bind(cluster_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 async fn load_review_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     cluster_id: Uuid,
 ) -> Result<Option<ReviewQueueRow>, sqlx::Error> {
     query_as::<_, ReviewQueueRow>(
@@ -72,12 +73,12 @@ async fn load_review_row(
         "#,
     )
     .bind(cluster_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 async fn load_golden_record_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     cluster_id: Uuid,
 ) -> Result<Option<GoldenRecordRow>, sqlx::Error> {
     query_as::<_, GoldenRecordRow>(
@@ -100,13 +101,15 @@ async fn load_golden_record_row(
         "#,
     )
     .bind(cluster_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 pub async fn list_clusters(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<ResolvedCluster>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, ClusterRow>(
         r#"
         SELECT
@@ -125,9 +128,10 @@ pub async fn list_clusters(
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -136,23 +140,26 @@ pub async fn list_clusters(
 
 pub async fn get_cluster(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(cluster_id): Path<Uuid>,
 ) -> ServiceResult<ClusterDetail> {
-    let Some(cluster_row) = load_cluster_row(&state.db, cluster_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let Some(cluster_row) = load_cluster_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
         return Err(not_found("cluster not found"));
     };
 
-    let review_item = load_review_row(&state.db, cluster_id)
+    let review_item = load_review_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?
         .map(Into::into);
-    let golden_record = load_golden_record_row(&state.db, cluster_id)
+    let golden_record = load_golden_record_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?
         .map(Into::into);
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ClusterDetail {
         cluster: cluster_row.into(),
@@ -163,7 +170,9 @@ pub async fn get_cluster(
 
 pub async fn list_review_queue(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<ReviewQueueItem>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, ReviewQueueRow>(
         r#"
         SELECT
@@ -182,9 +191,10 @@ pub async fn list_review_queue(
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -193,7 +203,9 @@ pub async fn list_review_queue(
 
 pub async fn list_golden_records(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<GoldenRecord>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, GoldenRecordRow>(
         r#"
         SELECT
@@ -211,9 +223,10 @@ pub async fn list_golden_records(
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -222,17 +235,19 @@ pub async fn list_golden_records(
 
 pub async fn submit_review(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(cluster_id): Path<Uuid>,
     Json(body): Json<SubmitReviewRequest>,
 ) -> ServiceResult<ClusterDetail> {
-    let Some(cluster_row) = load_cluster_row(&state.db, cluster_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let Some(cluster_row) = load_cluster_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
         return Err(not_found("cluster not found"));
     };
 
-    let review_row = load_review_row(&state.db, cluster_id)
+    let review_row = load_review_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?;
     let cluster: ResolvedCluster = cluster_row.into();
@@ -246,7 +261,7 @@ pub async fn submit_review(
     .bind(&updated_cluster.status)
     .bind(updated_cluster.requires_review)
     .bind(updated_cluster.suggested_golden_record_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
@@ -259,7 +274,7 @@ pub async fn submit_review(
         .bind(&review_item.reviewed_by)
         .bind(&review_item.notes)
         .bind(SqlJson(review_item.rationale.clone()))
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     }
@@ -273,14 +288,15 @@ pub async fn submit_review(
         } else {
             "active"
         })
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
-    let golden_record = load_golden_record_row(&state.db, cluster_id)
+    let golden_record = load_golden_record_row(&mut tx, cluster_id)
         .await
         .map_err(|cause| db_error(&cause))?
         .map(Into::into);
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ClusterDetail {
         cluster: updated_cluster,

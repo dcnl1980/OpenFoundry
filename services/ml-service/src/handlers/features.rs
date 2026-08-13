@@ -4,7 +4,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::Value;
-use sqlx::{query_as, FromRow};
+use sqlx::{query_as, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -14,8 +14,11 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, deserialize_json, not_found, to_json, ServiceResult};
+use super::{
+	bad_request, db_error, deserialize_json, not_found, tenant::begin_scope, to_json, ServiceResult,
+};
 
 #[derive(Debug, FromRow)]
 struct FeatureRow {
@@ -63,7 +66,7 @@ fn to_feature(row: FeatureRow) -> FeatureDefinition {
 }
 
 async fn load_feature_row(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 	feature_id: Uuid,
 ) -> Result<Option<FeatureRow>, sqlx::Error> {
 	query_as::<_, FeatureRow>(
@@ -92,11 +95,15 @@ async fn load_feature_row(
 		"#,
 	)
 	.bind(feature_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut **tx)
 	.await
 }
 
-pub async fn list_features(State(state): State<AppState>) -> ServiceResult<ListFeaturesResponse> {
+pub async fn list_features(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListFeaturesResponse> {
+	let mut tx = begin_scope(&state, &claims).await?;
 	let rows = query_as::<_, FeatureRow>(
 		r#"
 		SELECT
@@ -122,9 +129,10 @@ pub async fn list_features(State(state): State<AppState>) -> ServiceResult<ListF
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListFeaturesResponse {
 		data: rows.into_iter().map(to_feature).collect(),
@@ -133,12 +141,15 @@ pub async fn list_features(State(state): State<AppState>) -> ServiceResult<ListF
 
 pub async fn create_feature(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateFeatureRequest>,
 ) -> ServiceResult<FeatureDefinition> {
 	if body.name.trim().is_empty() || body.entity_name.trim().is_empty() {
 		return Err(bad_request("feature name and entity name are required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
 	let row = query_as::<_, FeatureRow>(
 		r#"
 		INSERT INTO ml_features (
@@ -157,9 +168,10 @@ pub async fn create_feature(
 			tags,
 			samples,
 			last_materialized_at,
-			last_online_sync_at
+			last_online_sync_at,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING
 			id,
 			name,
@@ -200,19 +212,23 @@ pub async fn create_feature(
 	} else {
 		None
 	})
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_feature(row)))
 }
 
 pub async fn update_feature(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(feature_id): Path<Uuid>,
 	Json(body): Json<UpdateFeatureRequest>,
 ) -> ServiceResult<FeatureDefinition> {
-	let Some(current) = load_feature_row(&state.db, feature_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(current) = load_feature_row(&mut tx, feature_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -273,19 +289,22 @@ pub async fn update_feature(
 	.bind(body.batch_schedule.unwrap_or(current.batch_schedule))
 	.bind(body.freshness_sla_minutes.unwrap_or(current.freshness_sla_minutes))
 	.bind(to_json(&tags))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_feature(row)))
 }
 
 pub async fn materialize_feature(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(feature_id): Path<Uuid>,
 	Json(body): Json<MaterializeFeatureRequest>,
 ) -> ServiceResult<FeatureDefinition> {
-	let Some(current) = load_feature_row(&state.db, feature_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(current) = load_feature_row(&mut tx, feature_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -333,23 +352,27 @@ pub async fn materialize_feature(
 	.bind(to_json(&samples))
 	.bind(now)
 	.bind(if current.online_enabled { Some(now) } else { current.last_online_sync_at })
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_feature(row)))
 }
 
 pub async fn get_online_feature_snapshot(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(feature_id): Path<Uuid>,
 ) -> ServiceResult<OnlineFeatureSnapshot> {
-	let Some(feature) = load_feature_row(&state.db, feature_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(feature) = load_feature_row(&mut tx, feature_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
 		return Err(not_found("feature not found"));
 	};
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(OnlineFeatureSnapshot {
 		feature_id: feature.id,

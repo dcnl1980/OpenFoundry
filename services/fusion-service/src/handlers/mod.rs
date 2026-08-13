@@ -1,6 +1,7 @@
 pub mod clusters;
 pub mod jobs;
 pub mod rules;
+pub mod tenant;
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
