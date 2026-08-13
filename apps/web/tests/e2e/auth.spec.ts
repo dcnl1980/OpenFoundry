@@ -36,5 +36,5 @@ test('register then login reaches the authenticated home', async ({ page }) => {
 
 	await expect(page).toHaveURL('/');
 	await expect(page.getByRole('heading', { name: 'Welcome to OpenFoundry' })).toBeVisible();
-	await expect(page.getByRole('link', { name: 'Datasets' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Datasets' })).toBeVisible();
 });
