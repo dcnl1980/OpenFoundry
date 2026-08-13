@@ -56,6 +56,7 @@ async fn main() {
         .route("/api/v1/auth/register", post(handlers::register::register))
         .route("/api/v1/auth/login", post(handlers::login::login))
         .route("/api/v1/auth/refresh", post(handlers::token::refresh))
+        .route("/api/v1/auth/refresh-token", post(handlers::token::refresh))
         .route("/api/v1/auth/mfa/complete", post(handlers::mfa::complete_login))
         .route(
             "/api/v1/auth/sso/providers/public",

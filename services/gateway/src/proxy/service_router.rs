@@ -111,6 +111,108 @@ pub(crate) fn apply_tenant_trust_headers(headers: &mut HeaderMap, tenant: &Tenan
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamService {
+    Auth,
+    Dataset,
+    Query,
+    Pipeline,
+    Ontology,
+    Workflow,
+    Notification,
+    Ml,
+    Ai,
+    Fusion,
+    Streaming,
+    Report,
+    Geospatial,
+    CodeRepo,
+    Marketplace,
+    Audit,
+    Nexus,
+    AppBuilder,
+    Notebook,
+    DataConnector,
+}
+
+pub(crate) fn upstream_service(path: &str) -> Option<UpstreamService> {
+    if path.starts_with("/api/v1/auth")
+        || path.starts_with("/api/v1/users")
+        || path.starts_with("/api/v1/roles")
+        || path.starts_with("/api/v1/permissions")
+        || path.starts_with("/api/v1/groups")
+        || path.starts_with("/api/v1/policies")
+        || path.starts_with("/api/v1/api-keys")
+    {
+        Some(UpstreamService::Auth)
+    } else if path.starts_with("/api/v1/datasets") {
+        Some(UpstreamService::Dataset)
+    } else if path.starts_with("/api/v1/queries") {
+        Some(UpstreamService::Query)
+    } else if path.starts_with("/api/v1/pipelines") || path.starts_with("/api/v1/lineage") {
+        Some(UpstreamService::Pipeline)
+    } else if path.starts_with("/api/v1/ontology") {
+        Some(UpstreamService::Ontology)
+    } else if path.starts_with("/api/v1/workflows") {
+        Some(UpstreamService::Workflow)
+    } else if path.starts_with("/api/v1/notifications") {
+        Some(UpstreamService::Notification)
+    } else if path.starts_with("/api/v1/ml") {
+        Some(UpstreamService::Ml)
+    } else if path.starts_with("/api/v1/ai") {
+        Some(UpstreamService::Ai)
+    } else if path.starts_with("/api/v1/fusion") {
+        Some(UpstreamService::Fusion)
+    } else if path.starts_with("/api/v1/streaming") {
+        Some(UpstreamService::Streaming)
+    } else if path.starts_with("/api/v1/reports") {
+        Some(UpstreamService::Report)
+    } else if path.starts_with("/api/v1/geospatial") {
+        Some(UpstreamService::Geospatial)
+    } else if path.starts_with("/api/v1/code-repos") {
+        Some(UpstreamService::CodeRepo)
+    } else if path.starts_with("/api/v1/marketplace") {
+        Some(UpstreamService::Marketplace)
+    } else if path.starts_with("/api/v1/audit") {
+        Some(UpstreamService::Audit)
+    } else if path.starts_with("/api/v1/nexus") {
+        Some(UpstreamService::Nexus)
+    } else if path.starts_with("/api/v1/apps") || path.starts_with("/api/v1/widgets") {
+        Some(UpstreamService::AppBuilder)
+    } else if path.starts_with("/api/v1/notebooks") {
+        Some(UpstreamService::Notebook)
+    } else if path.starts_with("/api/v1/connections") {
+        Some(UpstreamService::DataConnector)
+    } else {
+        None
+    }
+}
+
+fn upstream_base_url(config: &GatewayConfig, service: UpstreamService) -> &str {
+    match service {
+        UpstreamService::Auth => &config.auth_service_url,
+        UpstreamService::Dataset => &config.dataset_service_url,
+        UpstreamService::Query => &config.query_service_url,
+        UpstreamService::Pipeline => &config.pipeline_service_url,
+        UpstreamService::Ontology => &config.ontology_service_url,
+        UpstreamService::Workflow => &config.workflow_service_url,
+        UpstreamService::Notification => &config.notification_service_url,
+        UpstreamService::Ml => &config.ml_service_url,
+        UpstreamService::Ai => &config.ai_service_url,
+        UpstreamService::Fusion => &config.fusion_service_url,
+        UpstreamService::Streaming => &config.streaming_service_url,
+        UpstreamService::Report => &config.report_service_url,
+        UpstreamService::Geospatial => &config.geospatial_service_url,
+        UpstreamService::CodeRepo => &config.code_repo_service_url,
+        UpstreamService::Marketplace => &config.marketplace_service_url,
+        UpstreamService::Audit => &config.audit_service_url,
+        UpstreamService::Nexus => &config.nexus_service_url,
+        UpstreamService::AppBuilder => &config.app_builder_service_url,
+        UpstreamService::Notebook => &config.notebook_service_url,
+        UpstreamService::DataConnector => &config.data_connector_url,
+    }
+}
+
 /// Reverse-proxy handler: forwards requests to backend services based on URL prefix.
 pub async fn proxy_handler(
     State((config, client)): State<(GatewayConfig, Client)>,
@@ -125,45 +227,10 @@ pub async fn proxy_handler(
         .and_then(|token| jwt::decode_token(&JwtConfig::new(&config.jwt_secret), token).ok())
         .map(|claims| TenantContext::from_claims(&claims));
 
-    let upstream_base = if path.starts_with("/api/v1/auth") {
-        &config.auth_service_url
-    } else if path.starts_with("/api/v1/datasets") {
-        &config.dataset_service_url
-    } else if path.starts_with("/api/v1/queries") {
-        &config.query_service_url
-    } else if path.starts_with("/api/v1/pipelines") {
-        &config.pipeline_service_url
-    } else if path.starts_with("/api/v1/ontology") {
-        &config.ontology_service_url
-    } else if path.starts_with("/api/v1/workflows") {
-        &config.workflow_service_url
-    } else if path.starts_with("/api/v1/notifications") {
-        &config.notification_service_url
-    } else if path.starts_with("/api/v1/ml") {
-        &config.ml_service_url
-    } else if path.starts_with("/api/v1/ai") {
-        &config.ai_service_url
-    } else if path.starts_with("/api/v1/fusion") {
-        &config.fusion_service_url
-    } else if path.starts_with("/api/v1/streaming") {
-		&config.streaming_service_url
-        } else if path.starts_with("/api/v1/reports") {
-		&config.report_service_url
-        } else if path.starts_with("/api/v1/geospatial") {
-		&config.geospatial_service_url
-        } else if path.starts_with("/api/v1/code-repos") {
-		&config.code_repo_service_url
-        } else if path.starts_with("/api/v1/marketplace") {
-		&config.marketplace_service_url
-        } else if path.starts_with("/api/v1/audit") {
-		&config.audit_service_url
-    } else if path.starts_with("/api/v1/nexus") {
-		&config.nexus_service_url
-    } else if path.starts_with("/api/v1/apps") || path.starts_with("/api/v1/widgets") {
-        &config.app_builder_service_url
-    } else {
+    let Some(service) = upstream_service(path) else {
         return (StatusCode::NOT_FOUND, "unknown service route").into_response();
     };
+    let upstream_base = upstream_base_url(&config, service);
 
     let upstream_base = service_runtime::rewrite_upstream_base(upstream_base, config.tls_mode);
     let uri = format!("{upstream_base}{}", req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
@@ -390,5 +457,51 @@ mod tests {
         assert_eq!(remaining, 3);
         assert_eq!(take_chunk(&mut remaining, 4), Err(BodyTooLarge));
         assert_eq!(remaining, 3);
+    }
+
+    #[test]
+    fn auth_identity_routes_reach_auth_service() {
+        for path in [
+            "/api/v1/auth/login",
+            "/api/v1/users/me",
+            "/api/v1/users",
+            "/api/v1/roles",
+            "/api/v1/permissions",
+            "/api/v1/groups",
+            "/api/v1/policies",
+            "/api/v1/api-keys",
+        ] {
+            assert_eq!(
+                upstream_service(path),
+                Some(UpstreamService::Auth),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn lineage_and_notebooks_have_upstreams() {
+        assert_eq!(
+            upstream_service("/api/v1/lineage"),
+            Some(UpstreamService::Pipeline)
+        );
+        assert_eq!(
+            upstream_service("/api/v1/lineage/datasets/abc"),
+            Some(UpstreamService::Pipeline)
+        );
+        assert_eq!(
+            upstream_service("/api/v1/notebooks"),
+            Some(UpstreamService::Notebook)
+        );
+        assert_eq!(
+            upstream_service("/api/v1/connections"),
+            Some(UpstreamService::DataConnector)
+        );
+    }
+
+    #[test]
+    fn unknown_prefixes_have_no_upstream() {
+        assert_eq!(upstream_service("/api/v1/not-a-service"), None);
+        assert_eq!(upstream_service("/health"), None);
     }
 }

@@ -51,6 +51,10 @@ pub struct GatewayConfig {
     pub audit_service_url: String,
     #[serde(default = "default_nexus_service_url")]
     pub nexus_service_url: String,
+    #[serde(default = "default_notebook_service_url")]
+    pub notebook_service_url: String,
+    #[serde(default = "default_data_connector_url")]
+    pub data_connector_url: String,
     #[serde(skip)]
     pub tls_mode: service_runtime::TlsMode,
 }
@@ -125,6 +129,14 @@ fn default_audit_service_url() -> String {
 
 fn default_nexus_service_url() -> String {
 	"http://localhost:50067".to_string()
+}
+
+fn default_notebook_service_url() -> String {
+    "http://localhost:50062".to_string()
+}
+
+fn default_data_connector_url() -> String {
+    "http://localhost:50052".to_string()
 }
 
 impl GatewayConfig {
