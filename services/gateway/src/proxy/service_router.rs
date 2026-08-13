@@ -1,13 +1,87 @@
+use std::collections::HashSet;
+
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header::AUTHORIZATION, StatusCode, Uri},
+    http::{
+        header::{HeaderName, HeaderValue, AUTHORIZATION},
+        HeaderMap, StatusCode, Uri,
+    },
     response::{IntoResponse, Response},
 };
 use auth_middleware::{jwt, tenant::TenantContext, JwtConfig};
 use reqwest::Client;
 
 use crate::config::GatewayConfig;
+
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
+
+fn hop_by_hop_names(headers: &HeaderMap) -> HashSet<String> {
+    let mut names: HashSet<String> = HOP_BY_HOP.iter().map(|name| (*name).to_string()).collect();
+    if let Some(connection) = headers.get("connection").and_then(|value| value.to_str().ok()) {
+        for token in connection.split(',') {
+            let name = token.trim().to_ascii_lowercase();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
+fn insert_trusted_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    let Ok(name) = HeaderName::try_from(name) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+/// Drop client-supplied tenant headers and hop-by-hop headers before proxying.
+pub(crate) fn sanitize_forward_headers(headers: &HeaderMap) -> HeaderMap {
+    let hop_by_hop = hop_by_hop_names(headers);
+    let mut forwarded = HeaderMap::new();
+    for (key, value) in headers.iter() {
+        let name = key.as_str();
+        if name.starts_with("x-openfoundry-") || hop_by_hop.contains(name) {
+            continue;
+        }
+        forwarded.append(key.clone(), value.clone());
+    }
+    forwarded
+}
+
+/// Recreate tenant headers from the decoded JWT only.
+pub(crate) fn apply_tenant_trust_headers(headers: &mut HeaderMap, tenant: &TenantContext) {
+    insert_trusted_header(headers, "x-openfoundry-tenant-scope", &tenant.scope_id);
+    insert_trusted_header(headers, "x-openfoundry-tenant-tier", &tenant.tier);
+    insert_trusted_header(
+        headers,
+        "x-openfoundry-quota-query-limit",
+        &tenant.quotas.max_query_limit.to_string(),
+    );
+    insert_trusted_header(
+        headers,
+        "x-openfoundry-quota-pipeline-workers",
+        &tenant.quotas.max_pipeline_workers.to_string(),
+    );
+    insert_trusted_header(
+        headers,
+        "x-openfoundry-quota-requests-per-minute",
+        &tenant.quotas.requests_per_minute.to_string(),
+    );
+}
 
 /// Reverse-proxy handler: forwards requests to backend services based on URL prefix.
 pub async fn proxy_handler(
@@ -70,39 +144,25 @@ pub async fn proxy_handler(
     };
     *req.uri_mut() = uri;
 
-    // Forward the request via reqwest
     let method = req.method().clone();
     let url = req.uri().to_string();
-    let headers = req.headers().clone();
-        let body_limit = tenant
-		.as_ref()
-		.map(|tenant| tenant.clamp_request_body_bytes(10 * 1024 * 1024))
-		.unwrap_or(10 * 1024 * 1024);
+    let mut headers = sanitize_forward_headers(req.headers());
+    if let Some(tenant) = tenant.as_ref() {
+        apply_tenant_trust_headers(&mut headers, tenant);
+    }
+    let body_limit = tenant
+        .as_ref()
+        .map(|tenant| tenant.clamp_request_body_bytes(10 * 1024 * 1024))
+        .unwrap_or(10 * 1024 * 1024);
 
-        let body_bytes = match axum::body::to_bytes(req.into_body(), body_limit).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), body_limit).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
     };
 
     let mut upstream_req = client.request(method, &url);
     for (key, value) in headers.iter() {
-        if key != "host" {
-            upstream_req = upstream_req.header(key, value);
-        }
-    }
-    if let Some(tenant) = tenant {
-        upstream_req = upstream_req
-            .header("x-openfoundry-tenant-scope", tenant.scope_id)
-            .header("x-openfoundry-tenant-tier", tenant.tier)
-            .header("x-openfoundry-quota-query-limit", tenant.quotas.max_query_limit.to_string())
-            .header(
-                "x-openfoundry-quota-pipeline-workers",
-                tenant.quotas.max_pipeline_workers.to_string(),
-            )
-            .header(
-                "x-openfoundry-quota-requests-per-minute",
-                tenant.quotas.requests_per_minute.to_string(),
-            );
+        upstream_req = upstream_req.header(key, value);
     }
     upstream_req = upstream_req.body(body_bytes);
 
@@ -124,5 +184,124 @@ pub async fn proxy_handler(
             tracing::error!("upstream request failed: {e}");
             (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+    use auth_middleware::tenant::TenantQuotaPolicy;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (key, value) in pairs {
+            map.append(
+                HeaderName::from_bytes(key.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn strips_client_supplied_openfoundry_headers() {
+        let incoming = headers(&[
+            ("authorization", "Bearer client-token"),
+            ("x-openfoundry-tenant-scope", "attacker-scope"),
+            ("x-openfoundry-tenant-tier", "enterprise"),
+            ("x-openfoundry-quota-query-limit", "999999"),
+            ("X-OpenFoundry-Quota-Requests-Per-Minute", "1"),
+            ("content-type", "application/json"),
+        ]);
+
+        let sanitized = sanitize_forward_headers(&incoming);
+
+        assert!(sanitized.get("x-openfoundry-tenant-scope").is_none());
+        assert!(sanitized.get("x-openfoundry-tenant-tier").is_none());
+        assert!(sanitized.get("x-openfoundry-quota-query-limit").is_none());
+        assert!(sanitized.get("x-openfoundry-quota-requests-per-minute").is_none());
+        assert_eq!(
+            sanitized.get(AUTHORIZATION).and_then(|value| value.to_str().ok()),
+            Some("Bearer client-token")
+        );
+        assert_eq!(
+            sanitized
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn strips_hop_by_hop_headers_including_connection_list() {
+        let incoming = headers(&[
+            ("host", "evil.example"),
+            ("connection", "keep-alive, x-custom-hop"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-authorization", "Basic abc"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("te", "trailers"),
+            ("x-custom-hop", "should-drop"),
+            ("accept", "application/json"),
+        ]);
+
+        let sanitized = sanitize_forward_headers(&incoming);
+
+        assert!(sanitized.get("host").is_none());
+        assert!(sanitized.get("connection").is_none());
+        assert!(sanitized.get("keep-alive").is_none());
+        assert!(sanitized.get("proxy-authorization").is_none());
+        assert!(sanitized.get("transfer-encoding").is_none());
+        assert!(sanitized.get("upgrade").is_none());
+        assert!(sanitized.get("te").is_none());
+        assert!(sanitized.get("x-custom-hop").is_none());
+        assert_eq!(
+            sanitized.get("accept").and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn apply_tenant_headers_writes_only_trusted_values() {
+        let mut forwarded = sanitize_forward_headers(&headers(&[
+            ("x-openfoundry-tenant-scope", "attacker-scope"),
+            ("accept", "application/json"),
+        ]));
+        let tenant = TenantContext {
+            tenant_id: None,
+            scope_id: "trusted-scope".into(),
+            tier: "standard".into(),
+            workspace: None,
+            quotas: TenantQuotaPolicy::standard(),
+        };
+
+        apply_tenant_trust_headers(&mut forwarded, &tenant);
+
+        assert_eq!(
+            forwarded
+                .get("x-openfoundry-tenant-scope")
+                .and_then(|value| value.to_str().ok()),
+            Some("trusted-scope")
+        );
+        assert_eq!(
+            forwarded
+                .get("x-openfoundry-tenant-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("standard")
+        );
+        assert_eq!(
+            forwarded
+                .get("x-openfoundry-quota-query-limit")
+                .and_then(|value| value.to_str().ok()),
+            Some("2000")
+        );
+        assert_eq!(
+            forwarded
+                .get("accept")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 }

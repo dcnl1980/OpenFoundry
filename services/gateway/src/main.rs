@@ -20,6 +20,8 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
+    let audit = middleware::audit::connect_audit_handle(std::env::var("NATS_URL").ok().as_deref()).await;
+
     // Health check (unauthenticated)
     let health = Router::new().route("/health", get(|| async { "ok" }));
 
@@ -29,8 +31,11 @@ async fn main() {
     let app = Router::new()
         .merge(health)
         .merge(api)
+        .layer(axum_mw::from_fn_with_state(
+            audit,
+            middleware::audit::audit_layer,
+        ))
         .layer(axum_mw::from_fn(middleware::request_id::request_id_layer))
-        .layer(axum_mw::from_fn(middleware::audit::audit_layer))
         .layer(middleware::cors::cors_layer(&cfg.cors_origins))
         .layer(TraceLayer::new_for_http());
 

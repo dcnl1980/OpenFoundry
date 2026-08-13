@@ -397,8 +397,8 @@ If you want to help build OpenFoundry:
 4. Contribute code, docs, design, or feedback
 
 ```bash
-git clone https://github.com/open-foundry/open-foundry.git
-cd open-foundry
+git clone https://github.com/dcnl1980/OpenFoundry.git
+cd OpenFoundry
 cp .env.example .env
 ```
 
