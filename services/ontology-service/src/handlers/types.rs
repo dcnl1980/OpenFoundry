@@ -39,7 +39,7 @@ pub async fn create_object_type(
         Ok(ot) => (StatusCode::CREATED, Json(serde_json::json!(ot))).into_response(),
         Err(e) => {
             tracing::error!("create object type: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }
@@ -91,7 +91,7 @@ pub async fn get_object_type(
     {
         Ok(Some(ot)) => Json(serde_json::json!(ot)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }
 
@@ -124,7 +124,7 @@ pub async fn update_object_type(
     match result {
         Ok(Some(ot)) => Json(serde_json::json!(ot)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }
 
@@ -140,6 +140,6 @@ pub async fn delete_object_type(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }

@@ -4,6 +4,7 @@
   import {
     createActionType,
     createObject,
+    createProperty,
     deleteActionType,
     deleteObject,
     executeAction,
@@ -23,6 +24,7 @@
     type Property,
     type ValidateActionResponse,
   } from '$lib/api/ontology';
+  import { PROPERTY_TYPES, buildCreatePropertyBody } from '$lib/ontology/property-form';
 
   const objectTypeId = $derived($pageStore.params.id ?? '');
 
@@ -127,7 +129,15 @@
   let actionFormError = $state('');
   let actionFormSuccess = $state('');
   let objectError = $state('');
+  let propertyError = $state('');
   let runtimeError = $state('');
+  let creatingProperty = $state(false);
+  let propertyName = $state('');
+  let propertyDisplayName = $state('');
+  let propertyDescription = $state('');
+  let propertyType = $state<(typeof PROPERTY_TYPES)[number]>('string');
+  let propertyRequired = $state(false);
+  let propertyUnique = $state(false);
 
   let creatingAction = $state(false);
   let creatingObject = $state(false);
@@ -235,6 +245,43 @@
       error = cause instanceof Error ? cause.message : 'Failed to load ontology details';
     } finally {
       loading = false;
+    }
+  }
+
+  async function handleCreateProperty(event: Event) {
+    event.preventDefault();
+    if (!objectTypeId) {
+      return;
+    }
+
+    creatingProperty = true;
+    propertyError = '';
+
+    try {
+      const parsed = buildCreatePropertyBody({
+        name: propertyName,
+        display_name: propertyDisplayName,
+        description: propertyDescription,
+        property_type: propertyType,
+        required: propertyRequired,
+        unique_constraint: propertyUnique,
+      });
+      if (!parsed.ok) {
+        throw new Error(parsed.error);
+      }
+
+      await createProperty(objectTypeId, parsed.body);
+      propertyName = '';
+      propertyDisplayName = '';
+      propertyDescription = '';
+      propertyType = 'string';
+      propertyRequired = false;
+      propertyUnique = false;
+      await load();
+    } catch (cause) {
+      propertyError = cause instanceof Error ? cause.message : 'Failed to create property';
+    } finally {
+      creatingProperty = false;
     }
   }
 
@@ -461,6 +508,74 @@
             Open graph view
           </a>
         </div>
+
+        <form class="mt-4 space-y-3 rounded-2xl border border-slate-200 p-4 dark:border-slate-800" onsubmit={handleCreateProperty}>
+          <div class="grid gap-3 md:grid-cols-2">
+            <div>
+              <label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200" for="property-name">Name</label>
+              <input
+                id="property-name"
+                bind:value={propertyName}
+                class="w-full rounded-2xl border border-slate-300 px-4 py-2.5 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                placeholder="status"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200" for="property-display-name">Display name</label>
+              <input
+                id="property-display-name"
+                bind:value={propertyDisplayName}
+                class="w-full rounded-2xl border border-slate-300 px-4 py-2.5 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                placeholder="Status"
+              />
+            </div>
+          </div>
+          <div>
+            <label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200" for="property-description">Description</label>
+            <input
+              id="property-description"
+              bind:value={propertyDescription}
+              class="w-full rounded-2xl border border-slate-300 px-4 py-2.5 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+              placeholder="Lifecycle state used by update actions"
+            />
+          </div>
+          <div class="grid gap-3 md:grid-cols-[1fr_auto_auto_auto]">
+            <div>
+              <label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200" for="property-type">Type</label>
+              <select
+                id="property-type"
+                bind:value={propertyType}
+                class="w-full rounded-2xl border border-slate-300 px-4 py-2.5 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+              >
+                {#each PROPERTY_TYPES as typeName}
+                  <option value={typeName}>{typeName}</option>
+                {/each}
+              </select>
+            </div>
+            <label class="flex items-end gap-2 pb-2 text-sm text-slate-700 dark:text-slate-200">
+              <input type="checkbox" bind:checked={propertyRequired} />
+              Required
+            </label>
+            <label class="flex items-end gap-2 pb-2 text-sm text-slate-700 dark:text-slate-200">
+              <input type="checkbox" bind:checked={propertyUnique} />
+              Unique
+            </label>
+            <div class="flex items-end">
+              <button
+                type="submit"
+                disabled={creatingProperty}
+                class="rounded-full bg-teal-600 px-4 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
+              >
+                {creatingProperty ? 'Saving...' : 'Add property'}
+              </button>
+            </div>
+          </div>
+          {#if propertyError}
+            <div class="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+              {propertyError}
+            </div>
+          {/if}
+        </form>
 
         {#if properties.length === 0}
           <div class="mt-4 rounded-2xl border border-dashed border-slate-300 px-4 py-6 text-sm text-slate-500 dark:border-slate-700">

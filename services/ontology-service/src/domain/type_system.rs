@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::models::property::CreatePropertyRequest;
 
+#[derive(Debug)]
 pub struct PreparedProperty {
     pub name: String,
     pub display_name: String,

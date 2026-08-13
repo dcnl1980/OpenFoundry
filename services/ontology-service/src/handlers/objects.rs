@@ -54,7 +54,7 @@ pub async fn create_object(
         Ok(obj) => (StatusCode::CREATED, Json(serde_json::json!(obj))).into_response(),
         Err(e) => {
             tracing::error!("create object: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }
@@ -106,7 +106,7 @@ pub async fn get_object(
     {
         Ok(Some(obj)) => Json(serde_json::json!(obj)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }
 
@@ -122,6 +122,6 @@ pub async fn delete_object(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }
