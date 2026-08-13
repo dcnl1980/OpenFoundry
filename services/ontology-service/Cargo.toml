@@ -26,3 +26,6 @@ config = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+

@@ -10,18 +10,25 @@ use crate::models::object_type::*;
 use crate::AppState;
 use auth_middleware::layer::AuthUser;
 
+use super::tenant::begin_scope;
+
 pub async fn create_object_type(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Json(body): Json<CreateObjectTypeRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let id = Uuid::now_v7();
     let display_name = body.display_name.unwrap_or_else(|| body.name.clone());
     let description = body.description.unwrap_or_default();
+    let tenant_id = claims.tenant_scope_id();
 
     let result = sqlx::query_as::<_, ObjectType>(
-        r#"INSERT INTO object_types (id, name, display_name, description, primary_key_property, icon, color, owner_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        r#"INSERT INTO object_types (id, name, display_name, description, primary_key_property, icon, color, owner_id, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING *"#,
     )
     .bind(id)
@@ -32,11 +39,17 @@ pub async fn create_object_type(
     .bind(&body.icon)
     .bind(&body.color)
     .bind(claims.sub)
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(ot) => (StatusCode::CREATED, Json(serde_json::json!(ot))).into_response(),
+        Ok(ot) => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(ot))).into_response()
+        }
         Err(e) => {
             tracing::error!("create object type: {e}");
             super::db_failure(&e)
@@ -45,10 +58,14 @@ pub async fn create_object_type(
 }
 
 pub async fn list_object_types(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Query(params): Query<ListObjectTypesQuery>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -59,7 +76,7 @@ pub async fn list_object_types(
         "SELECT COUNT(*) FROM object_types WHERE name ILIKE $1 OR display_name ILIKE $1",
     )
     .bind(&search_pattern)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(0);
 
@@ -72,35 +89,51 @@ pub async fn list_object_types(
     .bind(&search_pattern)
     .bind(per_page)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .unwrap_or_default();
 
-    Json(ListObjectTypesResponse { data: types, total, page, per_page })
+    if let Err(error) = tx.commit().await {
+        return super::db_failure(&error);
+    }
+    Json(ListObjectTypesResponse { data: types, total, page, per_page }).into_response()
 }
 
 pub async fn get_object_type(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, ObjectType>("SELECT * FROM object_types WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
-        Ok(Some(ot)) => Json(serde_json::json!(ot)).into_response(),
+        Ok(Some(ot)) => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            Json(serde_json::json!(ot)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => super::db_failure(&e),
     }
 }
 
 pub async fn update_object_type(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateObjectTypeRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query_as::<_, ObjectType>(
         r#"UPDATE object_types SET
            display_name = COALESCE($2, display_name),
@@ -118,27 +151,41 @@ pub async fn update_object_type(
     .bind(&body.primary_key_property)
     .bind(&body.icon)
     .bind(&body.color)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
-        Ok(Some(ot)) => Json(serde_json::json!(ot)).into_response(),
+        Ok(Some(ot)) => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            Json(serde_json::json!(ot)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => super::db_failure(&e),
     }
 }
 
 pub async fn delete_object_type(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM object_types WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => super::db_failure(&e),
     }

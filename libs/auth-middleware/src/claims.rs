@@ -81,6 +81,15 @@ impl Claims {
         self.attributes.as_object().and_then(|map| map.get(key))
     }
 
+    /// Stable tenant partition key for row isolation.
+    ///
+    /// Organization members share `org_id`. Users without an organization are
+    /// isolated to their own subject so personal workspaces cannot see each other.
+    /// Admin roles do not bypass this boundary.
+    pub fn tenant_scope_id(&self) -> Uuid {
+        self.org_id.unwrap_or(self.sub)
+    }
+
     /// Get the issued-at time as a DateTime.
     pub fn issued_at(&self) -> Option<DateTime<Utc>> {
         DateTime::from_timestamp(self.iat, 0)
@@ -89,5 +98,50 @@ impl Claims {
     /// Get the expiration time as a DateTime.
     pub fn expires_at(&self) -> Option<DateTime<Utc>> {
         DateTime::from_timestamp(self.exp, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn claims(sub: Uuid, org_id: Option<Uuid>, roles: &[&str]) -> Claims {
+        Claims {
+            sub,
+            iat: 0,
+            exp: i64::MAX,
+            jti: Uuid::nil(),
+            email: "user@example.com".into(),
+            name: "User".into(),
+            roles: roles.iter().map(|role| (*role).to_string()).collect(),
+            permissions: vec![],
+            org_id,
+            attributes: json!({}),
+            auth_methods: vec![],
+            token_use: Some("access".into()),
+            api_key_id: None,
+        }
+    }
+
+    #[test]
+    fn tenant_scope_uses_organization_when_present() {
+        let user = Uuid::from_u128(1);
+        let org = Uuid::from_u128(99);
+        assert_eq!(claims(user, Some(org), &[]).tenant_scope_id(), org);
+    }
+
+    #[test]
+    fn tenant_scope_falls_back_to_subject_without_organization() {
+        let user = Uuid::from_u128(7);
+        assert_eq!(claims(user, None, &[]).tenant_scope_id(), user);
+    }
+
+    #[test]
+    fn admin_role_does_not_change_tenant_scope() {
+        let user = Uuid::from_u128(3);
+        let org = Uuid::from_u128(11);
+        assert_eq!(claims(user, Some(org), &["admin"]).tenant_scope_id(), org);
+        assert_eq!(claims(user, None, &["admin"]).tenant_scope_id(), user);
     }
 }
