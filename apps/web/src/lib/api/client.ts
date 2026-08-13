@@ -30,8 +30,14 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: response.statusText }));
-      throw new ApiError(response.status, error.error ?? 'Unknown error');
+      const raw = await response.text();
+      let parsed: unknown = raw;
+      try {
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        parsed = raw;
+      }
+      throw new ApiError(response.status, errorMessageFromBody(parsed, response.statusText));
     }
 
     if (response.status === 204) return undefined as T;
@@ -67,6 +73,24 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+export function errorMessageFromBody(body: unknown, fallback: string): string {
+  if (typeof body === 'string' && body.trim()) {
+    return body;
+  }
+
+  if (body && typeof body === 'object') {
+    const record = body as Record<string, unknown>;
+    if (typeof record.error === 'string' && record.error.trim()) {
+      return record.error;
+    }
+    if (typeof record.message === 'string' && record.message.trim()) {
+      return record.message;
+    }
+  }
+
+  return fallback || 'Unknown error';
 }
 
 export function emptyOnNotFound<T>(fallback: T): (error: unknown) => T {

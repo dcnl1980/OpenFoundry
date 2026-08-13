@@ -43,7 +43,7 @@ pub async fn create_link_type(
         Ok(lt) => (StatusCode::CREATED, Json(serde_json::json!(lt))).into_response(),
         Err(e) => {
             tracing::error!("create link type: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }
@@ -112,7 +112,7 @@ pub async fn delete_link_type(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }
 
@@ -161,7 +161,7 @@ pub async fn create_link(
         Ok(link) => (StatusCode::CREATED, Json(serde_json::json!(link))).into_response(),
         Err(e) => {
             tracing::error!("create link: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }
@@ -203,6 +203,6 @@ pub async fn delete_link(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::db_failure(&e),
     }
 }

@@ -26,7 +26,7 @@ pub async fn list_properties(
         Ok(properties) => Json(properties).into_response(),
         Err(e) => {
             tracing::error!("list properties: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }
@@ -39,7 +39,7 @@ pub async fn create_property(
 ) -> impl IntoResponse {
     let prepared = match prepare_new_property(&body) {
         Ok(prepared) => prepared,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => return super::json_error(StatusCode::BAD_REQUEST, message),
     };
 
     let object_type_exists = sqlx::query_scalar::<_, bool>(
@@ -54,7 +54,7 @@ pub async fn create_property(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("create property type lookup: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return super::db_failure(&e);
         }
     }
 
@@ -84,7 +84,7 @@ pub async fn create_property(
         Ok(property) => (StatusCode::CREATED, Json(property)).into_response(),
         Err(e) => {
             tracing::error!("create property: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            super::db_failure(&e)
         }
     }
 }

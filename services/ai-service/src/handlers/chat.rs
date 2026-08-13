@@ -806,7 +806,13 @@ pub async fn create_chat_completion(
 	let reply = if guardrail.blocked {
 		"Guardrails blocked this request. Remove prompt-injection or toxic content and retry.".to_string()
 	} else {
-		llm::gateway::synthesize_completion(&provider, &prompt_used, &knowledge_hits)
+		match llm::completion::complete(&state.http_client, &provider, &prompt_used).await {
+			Ok(text) => text,
+			Err(cause) => {
+				tracing::warn!("live chat completion failed: {cause}");
+				llm::gateway::synthesize_completion(&provider, &prompt_used, &knowledge_hits)
+			}
+		}
 	};
 	let completion_tokens = llm::gateway::estimate_tokens(&reply).min(body.max_tokens);
 	let payload = CachedChatPayload {
@@ -919,24 +925,30 @@ pub async fn ask_copilot(
 		body.include_sql,
 		body.include_pipeline_plan,
 	);
+	let live_answer = if guardrail.blocked {
+		None
+	} else {
+		let prompt = copilot::completion_prompt(
+			&body.question,
+			&body.dataset_ids,
+			&body.ontology_type_ids,
+			&cited_knowledge,
+		);
+		match llm::completion::complete(&state.http_client, &provider, &prompt).await {
+			Ok(text) => Some(text),
+			Err(cause) => {
+				tracing::warn!("live copilot completion failed: {cause}");
+				None
+			}
+		}
+	};
+	let draft = copilot::apply_live_answer(draft, live_answer, guardrail.blocked);
 
 	let payload = CachedCopilotPayload {
-		answer: if guardrail.blocked {
-			"Guardrails blocked this copilot request. Remove unsafe instructions and retry.".to_string()
-		} else {
-			draft.answer.clone()
-		},
-		suggested_sql: if guardrail.blocked { None } else { draft.suggested_sql.clone() },
-		pipeline_suggestions: if guardrail.blocked {
-			Vec::new()
-		} else {
-			draft.pipeline_suggestions.clone()
-		},
-		ontology_hints: if guardrail.blocked {
-			Vec::new()
-		} else {
-			draft.ontology_hints.clone()
-		},
+		answer: draft.answer,
+		suggested_sql: draft.suggested_sql,
+		pipeline_suggestions: draft.pipeline_suggestions,
+		ontology_hints: draft.ontology_hints,
 		cited_knowledge: cited_knowledge.clone(),
 	};
 

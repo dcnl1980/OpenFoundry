@@ -24,8 +24,8 @@ Scope: this Rust + Svelte tree (`dcnl1980/OpenFoundry`), compared with the four 
    A down dataset-service also hid knowledge bases, even though `/ai/copilot/ask` can run without either list.  
    Fix: load each list independently and wait for `auth.restore()` before fetching.
 
-## Follow-ups (not in this change)
+## Follow-ups
 
-- There is still no UI form to create properties; only the API client + new POST route exist.
-- Copilot answers are drafted in-process (`domain/copilot.rs`); they are not a live model completion.
-- Several ontology error bodies are plain strings, so the web client surfaces `Unknown error` instead of the SQL/message text.
+- Property create form on `/ontology/[id]`, posting to `POST /api/v1/ontology/types/{id}/properties`.
+- Copilot (and chat) now call the configured provider HTTP API; local drafts remain a fallback when the live call fails.
+- Ontology handlers return `{ "error": "..." }` and the web client reads string or JSON error bodies.
