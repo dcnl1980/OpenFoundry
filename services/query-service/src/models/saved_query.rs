@@ -10,6 +10,7 @@ pub struct SavedQuery {
     pub description: String,
     pub sql: String,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

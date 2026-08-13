@@ -60,6 +60,8 @@ JWT → Claims::tenant_scope_id()
 
 The application database role must **not** be `SUPERUSER` or `BYPASSRLS`. Superusers silently skip RLS even when `FORCE ROW LEVEL SECURITY` is on. Cross-tenant reads, writes, search, and guessed UUIDs must be indistinguishable 404/empty results.
 
+This data-plane boundary is enforced today on ontology, saved queries, and datasets. Other domain services still need the same `tenant_id` + RLS + tenant-transaction treatment.
+
 ## Auth trust chain
 
 1. User signs in through `auth-service`. The browser stores the JWT.
