@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -10,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use auth_middleware::{jwt, tenant::TenantContext, JwtConfig};
+use futures::StreamExt;
 use reqwest::Client;
 
 use crate::config::GatewayConfig;
@@ -60,6 +63,31 @@ pub(crate) fn sanitize_forward_headers(headers: &HeaderMap) -> HeaderMap {
         forwarded.append(key.clone(), value.clone());
     }
     forwarded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyTooLarge;
+
+pub(crate) fn request_body_limit(tenant: Option<&TenantContext>) -> usize {
+    tenant
+        .map(|tenant| tenant.quotas.max_request_body_bytes.max(1))
+        .unwrap_or(10 * 1024 * 1024)
+}
+
+pub(crate) fn content_length_exceeds(headers: &HeaderMap, limit: usize) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+}
+
+pub(crate) fn take_chunk(remaining: &mut usize, chunk_len: usize) -> Result<(), BodyTooLarge> {
+    if chunk_len > *remaining {
+        return Err(BodyTooLarge);
+    }
+    *remaining -= chunk_len;
+    Ok(())
 }
 
 /// Recreate tenant headers from the decoded JWT only.
@@ -151,35 +179,53 @@ pub async fn proxy_handler(
     if let Some(tenant) = tenant.as_ref() {
         apply_tenant_trust_headers(&mut headers, tenant);
     }
-    let body_limit = tenant
-        .as_ref()
-        .map(|tenant| tenant.clamp_request_body_bytes(10 * 1024 * 1024))
-        .unwrap_or(10 * 1024 * 1024);
+    let body_limit = request_body_limit(tenant.as_ref());
+    if content_length_exceeds(&headers, body_limit) {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+    }
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), body_limit).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
-    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let remaining = Arc::new(Mutex::new(body_limit));
+    let overflow_flag = overflow.clone();
+    let remaining_flag = remaining.clone();
+    let stream = req.into_body().into_data_stream().map(move |chunk| {
+        let bytes = chunk.map_err(std::io::Error::other)?;
+        let mut remaining = remaining_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if take_chunk(&mut remaining, bytes.len()).is_err() {
+            overflow_flag.store(true, Ordering::SeqCst);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "body too large",
+            ));
+        }
+        Ok(bytes)
+    });
 
     let mut upstream_req = client.request(method, &url);
     for (key, value) in headers.iter() {
         upstream_req = upstream_req.header(key, value);
     }
-    upstream_req = upstream_req.body(body_bytes);
+    upstream_req = upstream_req.body(reqwest::Body::wrap_stream(stream));
 
     match upstream_req.send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let headers = resp.headers().clone();
-            let body = resp.bytes().await.unwrap_or_default();
-
+            let headers = sanitize_forward_headers(resp.headers());
+            let stream = resp.bytes_stream();
             let mut response = Response::builder().status(status);
             for (key, value) in headers.iter() {
                 response = response.header(key, value);
             }
-            response.body(Body::from(body)).unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "proxy error").into_response()
-            })
+            response
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "proxy error").into_response()
+                })
+        }
+        Err(_) if overflow.load(Ordering::SeqCst) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()
         }
         Err(e) => {
             tracing::error!("upstream request failed: {e}");
@@ -304,5 +350,45 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
+    }
+
+    #[test]
+    fn request_body_limit_uses_tenant_clamp() {
+        let tenant = TenantContext {
+            tenant_id: None,
+            scope_id: "scope".into(),
+            tier: "standard".into(),
+            workspace: None,
+            quotas: TenantQuotaPolicy::standard(),
+        };
+        assert_eq!(request_body_limit(Some(&tenant)), 10 * 1024 * 1024);
+        assert_eq!(request_body_limit(None), 10 * 1024 * 1024);
+
+        let mut small = TenantQuotaPolicy::standard();
+        small.max_request_body_bytes = 1024;
+        let tenant = TenantContext {
+            quotas: small,
+            ..tenant
+        };
+        assert_eq!(request_body_limit(Some(&tenant)), 1024);
+    }
+
+    #[test]
+    fn content_length_exceeds_declared_limit() {
+        let over = headers(&[("content-length", "2048")]);
+        let under = headers(&[("content-length", "512")]);
+        let missing = headers(&[]);
+        assert!(content_length_exceeds(&over, 1024));
+        assert!(!content_length_exceeds(&under, 1024));
+        assert!(!content_length_exceeds(&missing, 1024));
+    }
+
+    #[test]
+    fn take_chunk_rejects_when_remaining_bytes_are_exhausted() {
+        let mut remaining = 8;
+        assert!(take_chunk(&mut remaining, 5).is_ok());
+        assert_eq!(remaining, 3);
+        assert_eq!(take_chunk(&mut remaining, 4), Err(BodyTooLarge));
+        assert_eq!(remaining, 3);
     }
 }

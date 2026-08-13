@@ -220,14 +220,14 @@ pub async fn serve(app: Router, addr: &str, settings: TlsSettings) -> Result<(),
 				"TLS disabled; serving plaintext HTTP (development only)"
 			);
 			let listener = tokio::net::TcpListener::bind(addr).await?;
-			axum::serve(listener, app).await
+			axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
 		}
 		mode => {
 			let config = server_config(&settings)
 				.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 			tracing::info!(%addr, ?mode, "serving with TLS");
 			axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config)))
-				.serve(app.into_make_service())
+				.serve(app.into_make_service_with_connect_info::<SocketAddr>())
 				.await
 		}
 	}
