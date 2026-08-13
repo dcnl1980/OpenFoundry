@@ -9,6 +9,7 @@ pub struct Notebook {
     pub name: String,
     pub description: String,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub default_kernel: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

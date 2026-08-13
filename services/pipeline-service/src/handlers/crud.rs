@@ -12,11 +12,17 @@ use crate::models::pipeline::*;
 use crate::AppState;
 use auth_middleware::layer::AuthUser;
 
+use super::tenant::begin_scope;
+
 pub async fn create_pipeline(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Json(body): Json<CreatePipelineRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let id = Uuid::now_v7();
     let description = body.description.unwrap_or_default();
     let dag = serde_json::to_value(&body.nodes).unwrap_or_default();
@@ -24,28 +30,36 @@ pub async fn create_pipeline(
     let schedule_config = body.schedule_config.unwrap_or_default();
     let retry_policy = body.retry_policy.unwrap_or_default();
     let next_run_at = executor::compute_next_run_at_from_parts(&status, &schedule_config);
+    let tenant_id = claims.tenant_scope_id();
 
     let result = sqlx::query_as::<_, Pipeline>(
         r#"INSERT INTO pipelines (
-               id, name, description, owner_id, dag, status, schedule_config, retry_policy, next_run_at
+               id, name, description, owner_id, tenant_id, dag, status, schedule_config, retry_policy, next_run_at
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            RETURNING *"#,
     )
     .bind(id)
     .bind(&body.name)
     .bind(&description)
     .bind(claims.sub)
+    .bind(tenant_id)
     .bind(&dag)
     .bind(&status)
     .bind(serde_json::to_value(&schedule_config).unwrap_or_else(|_| json!({})))
     .bind(serde_json::to_value(&retry_policy).unwrap_or_else(|_| json!({})))
     .bind(next_run_at)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(p) => (StatusCode::CREATED, Json(serde_json::json!(p))).into_response(),
+        Ok(p) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("create pipeline commit failed: {error}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(p))).into_response()
+        }
         Err(e) => {
             tracing::error!("create pipeline: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -54,10 +68,14 @@ pub async fn create_pipeline(
 }
 
 pub async fn list_pipelines(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Query(params): Query<ListPipelinesQuery>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -71,7 +89,7 @@ pub async fn list_pipelines(
     )
     .bind(&pattern)
     .bind(&params.status)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(0);
 
@@ -85,38 +103,57 @@ pub async fn list_pipelines(
     .bind(&params.status)
     .bind(per_page)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .unwrap_or_default();
 
-    Json(ListPipelinesResponse { data: pipelines, total, page, per_page })
+    if let Err(error) = tx.commit().await {
+        tracing::error!("list pipelines commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(ListPipelinesResponse { data: pipelines, total, page, per_page }).into_response()
 }
 
 pub async fn get_pipeline(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Pipeline>("SELECT * FROM pipelines WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
-        Ok(Some(p)) => Json(serde_json::json!(p)).into_response(),
+        Ok(Some(p)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("get pipeline commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!(p)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn update_pipeline(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdatePipelineRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let existing = match sqlx::query_as::<_, Pipeline>("SELECT * FROM pipelines WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
         Ok(Some(pipeline)) => pipeline,
@@ -165,27 +202,43 @@ pub async fn update_pipeline(
     .bind(serde_json::to_value(&schedule_config).unwrap_or_else(|_| json!({})))
     .bind(serde_json::to_value(&retry_policy).unwrap_or_else(|_| json!({})))
     .bind(next_run_at)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
-        Ok(Some(p)) => Json(serde_json::json!(p)).into_response(),
+        Ok(Some(p)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("update pipeline commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!(p)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn delete_pipeline(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM pipelines WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("delete pipeline commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

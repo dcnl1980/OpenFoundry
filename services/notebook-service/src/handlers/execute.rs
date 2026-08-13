@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::cell::{Cell, CellOutput, ExecuteCellRequest};
@@ -11,20 +12,29 @@ use crate::models::session::Session;
 use crate::AppState;
 use auth_middleware::layer::AuthUser;
 
-async fn update_session_status(db: &sqlx::PgPool, session_id: Uuid, status: &str) {
+use super::tenant::begin_scope;
+
+async fn update_session_status(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    status: &str,
+) {
     let _ = sqlx::query(
         "UPDATE sessions SET status = $2, last_activity = NOW() WHERE id = $1",
     )
     .bind(session_id)
     .bind(status)
-    .execute(db)
+    .execute(&mut **tx)
     .await;
 }
 
-async fn load_session(db: &sqlx::PgPool, session_id: Uuid) -> Result<Option<Session>, sqlx::Error> {
+async fn load_session(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+) -> Result<Option<Session>, sqlx::Error> {
     sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
         .bind(session_id)
-        .fetch_optional(db)
+        .fetch_optional(&mut **tx)
         .await
 }
 
@@ -34,9 +44,13 @@ pub async fn execute_cell(
     Path((_notebook_id, cell_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<ExecuteCellRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let cell = match sqlx::query_as::<_, Cell>("SELECT * FROM cells WHERE id = $1")
         .bind(cell_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
         Ok(Some(c)) => c,
@@ -45,6 +59,10 @@ pub async fn execute_cell(
     };
 
     if cell.cell_type == "markdown" {
+        if let Err(error) = tx.commit().await {
+            tracing::error!("execute markdown cell commit failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         return Json(serde_json::json!(CellOutput {
             output_type: "text".into(),
             content: serde_json::json!(cell.source),
@@ -54,7 +72,7 @@ pub async fn execute_cell(
     }
 
     let session = match body.session_id {
-        Some(session_id) => match load_session(&state.db, session_id).await {
+        Some(session_id) => match load_session(&mut tx, session_id).await {
             Ok(Some(session)) => {
                 if session.status == "dead" {
                     return (StatusCode::CONFLICT, "session is stopped").into_response();
@@ -75,7 +93,7 @@ pub async fn execute_cell(
     };
 
     if let Some(session) = &session {
-        update_session_status(&state.db, session.id, "busy").await;
+        update_session_status(&mut tx, session.id, "busy").await;
     }
 
     let result = state
@@ -112,11 +130,16 @@ pub async fn execute_cell(
     .bind(cell_id)
     .bind(&output_json)
     .bind(exec_count)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
 
     if let Some(session) = &session {
-        update_session_status(&state.db, session.id, "idle").await;
+        update_session_status(&mut tx, session.id, "idle").await;
+    }
+
+    if let Err(error) = tx.commit().await {
+        tracing::error!("execute cell commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     Json(serde_json::json!(output)).into_response()
@@ -128,8 +151,12 @@ pub async fn execute_all_cells(
     Path(notebook_id): Path<Uuid>,
     Json(body): Json<ExecuteCellRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let shared_session = match body.session_id {
-        Some(session_id) => match load_session(&state.db, session_id).await {
+        Some(session_id) => match load_session(&mut tx, session_id).await {
             Ok(session) => session,
             Err(error) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -139,14 +166,14 @@ pub async fn execute_all_cells(
     };
 
     if let Some(session) = &shared_session {
-        update_session_status(&state.db, session.id, "busy").await;
+        update_session_status(&mut tx, session.id, "busy").await;
     }
 
     let cells = sqlx::query_as::<_, Cell>(
         "SELECT * FROM cells WHERE notebook_id = $1 AND cell_type = 'code' ORDER BY position ASC",
     )
     .bind(notebook_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .unwrap_or_default();
 
@@ -183,14 +210,19 @@ pub async fn execute_all_cells(
         .bind(cell.id)
         .bind(&output_json)
         .bind(count)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await;
 
         results.push(serde_json::json!({ "cell_id": cell.id, "output": output }));
     }
 
     if let Some(session) = &shared_session {
-        update_session_status(&state.db, session.id, "idle").await;
+        update_session_status(&mut tx, session.id, "idle").await;
+    }
+
+    if let Err(error) = tx.commit().await {
+        tracing::error!("execute all cells commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     Json(serde_json::json!({ "results": results })).into_response()

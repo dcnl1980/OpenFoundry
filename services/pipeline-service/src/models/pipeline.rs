@@ -10,6 +10,7 @@ pub struct Pipeline {
     pub name: String,
     pub description: String,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub dag: serde_json::Value,
     pub status: String,
     pub schedule_config: Value,

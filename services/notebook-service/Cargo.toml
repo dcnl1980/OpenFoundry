@@ -29,3 +29,6 @@ thiserror = { workspace = true }
 pyo3 = { workspace = true }
 reqwest = { workspace = true }
 arrow = { version = "53" }
+
+[dev-dependencies]
+tokio = { workspace = true }

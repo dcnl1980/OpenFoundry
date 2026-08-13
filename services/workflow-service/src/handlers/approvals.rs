@@ -15,11 +15,19 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
+
+use super::tenant::begin_scope;
 
 pub async fn list_approvals(
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Query(params): Query<ListApprovalsQuery>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let page = params.page.unwrap_or(1).max(1);
 	let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
 	let offset = (page - 1) * per_page;
@@ -37,7 +45,7 @@ pub async fn list_approvals(
 	.bind(params.workflow_id)
 	.bind(per_page)
 	.bind(offset)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await;
 
 	let total = sqlx::query_scalar::<_, i64>(
@@ -49,18 +57,24 @@ pub async fn list_approvals(
 	.bind(&params.status)
 	.bind(params.assigned_to)
 	.bind(params.workflow_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.unwrap_or(0);
 
 	match approvals {
-		Ok(data) => Json(serde_json::json!({
-			"data": data,
-			"page": page,
-			"per_page": per_page,
-			"total": total,
-		}))
-		.into_response(),
+		Ok(data) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("list approvals commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(serde_json::json!({
+				"data": data,
+				"page": page,
+				"per_page": per_page,
+				"total": total,
+			}))
+			.into_response()
+		}
 		Err(error) => {
 			tracing::error!("list approvals failed: {error}");
 			StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -71,14 +85,18 @@ pub async fn list_approvals(
 pub async fn decide_approval(
 	State(state): State<AppState>,
 	Path(approval_id): Path<Uuid>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<ApprovalDecisionRequest>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let approval = sqlx::query_as::<_, WorkflowApproval>(
 		r#"SELECT * FROM workflow_approvals WHERE id = $1"#,
 	)
 	.bind(approval_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *tx)
 	.await;
 
 	let Some(approval) = (match approval {
@@ -113,7 +131,7 @@ pub async fn decide_approval(
 	.bind(&body.decision)
 	.bind(&body.payload)
 	.bind(claims.sub)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await;
 
 	let Ok(updated_approval) = updated_approval else {
@@ -125,7 +143,7 @@ pub async fn decide_approval(
 		r#"SELECT * FROM workflows WHERE id = $1"#,
 	)
 	.bind(updated_approval.workflow_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	{
 		Ok(workflow) => workflow,
@@ -139,7 +157,7 @@ pub async fn decide_approval(
 		r#"SELECT * FROM workflow_runs WHERE id = $1"#,
 	)
 	.bind(updated_approval.workflow_run_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	{
 		Ok(run) => run,
@@ -182,7 +200,7 @@ pub async fn decide_approval(
 	)
 	.bind(run.id)
 	.bind(&context)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	{
 		Ok(run) => run,
@@ -191,6 +209,10 @@ pub async fn decide_approval(
 			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 		}
 	};
+	if let Err(error) = tx.commit().await {
+		tracing::error!("approval decision commit failed: {error}");
+		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+	}
 
 	match executor::continue_after_approval(&state, &workflow, run, &body.decision, step).await {
 		Ok(updated_run) => Json(serde_json::json!({

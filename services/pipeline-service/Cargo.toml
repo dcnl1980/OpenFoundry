@@ -31,3 +31,6 @@ base64 = { workspace = true }
 cron = "0.12"
 wasmtime = "24"
 
+[dev-dependencies]
+tokio = { workspace = true }
+
