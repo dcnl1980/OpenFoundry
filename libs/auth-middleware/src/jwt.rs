@@ -75,6 +75,10 @@ pub fn decode_token(config: &JwtConfig, token: &str) -> Result<Claims, JwtError>
     Ok(data.claims)
 }
 
+pub fn is_usable_access_token(token_use: Option<&str>) -> bool {
+    matches!(token_use, None | Some("access") | Some("api_key"))
+}
+
 /// Build a new Claims set for a user (access token).
 pub fn build_access_claims(
     config: &JwtConfig,
@@ -153,5 +157,19 @@ pub fn build_api_key_claims(
         auth_methods: vec!["api_key".to_string()],
         token_use: Some("api_key".to_string()),
         api_key_id: Some(api_key_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usable_access_tokens_exclude_refresh_and_id_tokens() {
+        assert!(is_usable_access_token(Some("access")));
+        assert!(is_usable_access_token(Some("api_key")));
+        assert!(is_usable_access_token(None));
+        assert!(!is_usable_access_token(Some("refresh")));
+        assert!(!is_usable_access_token(Some("id")));
     }
 }

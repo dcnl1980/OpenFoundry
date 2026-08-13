@@ -74,10 +74,7 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     tracing::info!("starting data-connector on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
+    service_runtime::serve(app, &addr, service_runtime::TlsSettings::from_env())
         .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app).await.expect("server error");
+        .expect("server error");
 }

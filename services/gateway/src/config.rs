@@ -51,6 +51,8 @@ pub struct GatewayConfig {
     pub audit_service_url: String,
     #[serde(default = "default_nexus_service_url")]
     pub nexus_service_url: String,
+    #[serde(skip)]
+    pub tls_mode: service_runtime::TlsMode,
 }
 
 fn default_anonymous_rpm() -> u32 {
@@ -127,9 +129,11 @@ fn default_nexus_service_url() -> String {
 
 impl GatewayConfig {
     pub fn from_env() -> Result<Self, config::ConfigError> {
-        config::Config::builder()
+        let mut cfg: Self = config::Config::builder()
             .add_source(config::Environment::default().separator("__"))
             .build()?
-            .try_deserialize()
+            .try_deserialize()?;
+        cfg.tls_mode = service_runtime::TlsSettings::from_env().mode();
+        Ok(cfg)
     }
 }

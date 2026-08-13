@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 core-models = { workspace = true }
 auth-middleware = { workspace = true }
+service-runtime = { workspace = true }
 event-bus = { workspace = true }
 storage-abstraction = { workspace = true }
 query-engine = { workspace = true }

@@ -63,7 +63,9 @@ Services must not trust the client for that scope. The only trusted copy is the 
    | `x-openfoundry-quota-requests-per-minute` | tier / `tenant_quotas` |
 
 5. Hop-by-hop headers (`host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `te`, `proxy-*`, plus names listed in `Connection`) are not forwarded.
-6. Downstream services may read those headers, but they are only as trustworthy as this gateway hop. There is no service-to-service mTLS yet.
+6. Downstream services may read those headers only after the hop is authenticated. In production, set `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `TLS_CA_PATH` on every service and the gateway so the hop is **mTLS**: services present a server cert, the gateway presents a client cert, and both verify the shared CA. Without those three variables the process logs a warning and serves plaintext HTTP (development only).
+7. Every domain service now starts through `service_runtime::serve`, which applies a 10 MiB default body limit and the same TLS mode. Service-to-service HTTP clients (gateway, ontology, workflow, notification) load the same client identity and CA.
+8. Domain `auth_layer` rejects refresh tokens. Protected routes already require a JWT; mTLS is what stops a caller from bypassing the gateway and talking to a service port directly.
 
 The gateway **rejects** requests without a valid access or API-key JWT (`401 unauthorized`), except this public allowlist:
 
@@ -97,7 +99,8 @@ Each request produces one audit payload (`action = request.forwarded`):
 | Request body over tenant clamp | `413 body too large` | Declared `Content-Length` is rejected up front; a streamed body that exceeds the remaining budget aborts the upstream call |
 | Tenant or IP over `requests_per_minute` | `429 rate limit exceeded` + `Retry-After` | In-process token bucket; `/health` is exempt. Not shared across gateway replicas |
 | Missing/invalid JWT on a private route | `401 unauthorized` | Request never reaches a backend service |
-| Refresh token used as an access token | `401 unauthorized` | `token_use` must be `access`, `api_key`, or unset |
+| Refresh token used as an access token | `401 unauthorized` | Gateway and domain `auth_layer` accept only `access`, `api_key`, or unset |
+| mTLS required but client has no cert | TLS handshake fails / `502` at the gateway | Service never sees the HTTP request |
 | NATS down at boot | API still works | Audit handle is disabled |
 | NATS down at runtime | API still works | Worker logs publish failures; queue may drop |
 | Audit queue full | API still works | Event dropped (`queue full`) |
@@ -118,8 +121,8 @@ Request and response bodies are streamed. The gateway does not buffer the full p
 ## What this map does not claim
 
 - Redis rate limits are a fixed one-minute window, not a distributed token bucket.
-- There is still no service-to-service mTLS.
-- `ROADMAP.md` status icons mean a service or UI surface exists, not that every domain feature is production-ready. The gateway control hop (auth gate, header trust, audit, rate limit, streamed bodies) is what this document describes as production-ready.
+- Domain handlers are not a full rewrite; they now share mTLS, a 10 MiB body limit, and access-token checks.
+- `ROADMAP.md` status icons mean a service or UI surface exists, not that every domain feature is production-ready. The gateway control hop (auth gate, header trust, audit, rate limit, streamed bodies, mTLS) is what this document describes as production-ready.
 
 ## Related docs
 

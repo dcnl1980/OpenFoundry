@@ -48,10 +48,12 @@ async fn main() {
         .expect("failed to run migrations");
 
     let jwt_config = JwtConfig::new(&cfg.jwt_secret);
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("failed to build notification HTTP client");
+    let tls = service_runtime::TlsSettings::from_env();
+    let http_client = service_runtime::configure_http_client(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)),
+        &tls,
+    )
+    .expect("failed to build notification HTTP client");
     let email_sender = cfg.smtp_host.as_deref().map(build_smtp_transport).transpose().expect("failed to build SMTP transport");
     let email_from = cfg
         .smtp_from_address
@@ -116,12 +118,9 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     tracing::info!("starting notification-service on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
+    service_runtime::serve(app, &addr, tls)
         .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app).await.expect("server error");
+        .expect("server error");
 }
 
 fn build_smtp_transport(host: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>, lettre::transport::smtp::Error> {

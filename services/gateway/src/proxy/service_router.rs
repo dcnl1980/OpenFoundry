@@ -165,6 +165,7 @@ pub async fn proxy_handler(
         return (StatusCode::NOT_FOUND, "unknown service route").into_response();
     };
 
+    let upstream_base = service_runtime::rewrite_upstream_base(upstream_base, config.tls_mode);
     let uri = format!("{upstream_base}{}", req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
 
     let Ok(uri) = uri.parse::<Uri>() else {

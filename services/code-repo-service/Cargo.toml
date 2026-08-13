@@ -10,6 +10,7 @@ license.workspace = true
 core-models = { workspace = true }
 event-bus = { workspace = true }
 auth-middleware = { workspace = true }
+service-runtime = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

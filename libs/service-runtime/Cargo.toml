@@ -1,0 +1,21 @@
+[package]
+name = "service-runtime"
+description = "Shared HTTP/TLS serve helpers and mTLS client configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"

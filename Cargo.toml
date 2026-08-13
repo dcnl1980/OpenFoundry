@@ -12,6 +12,7 @@ members = [
     "libs/geospatial-core",
     "libs/audit-trail",
     "libs/testing",
+    "libs/service-runtime",
 
     # ── Developer Tooling ──
     "tools/of-cli",
@@ -136,6 +137,7 @@ geospatial-core = { path = "libs/geospatial-core" }
 audit-trail = { path = "libs/audit-trail" }
 testing = { path = "libs/testing" }
 plugin-sdk = { path = "libs/plugin-sdk" }
+service-runtime = { path = "libs/service-runtime" }
 
 [profile.dev]
 opt-level = 0

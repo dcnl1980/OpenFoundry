@@ -32,10 +32,11 @@ pub async fn auth_layer(
     };
 
     match jwt::decode_token(&config, token) {
-        Ok(claims) => {
+        Ok(claims) if jwt::is_usable_access_token(claims.token_use.as_deref()) => {
             req.extensions_mut().insert(claims);
             next.run(req).await
         }
+        Ok(_) => (StatusCode::UNAUTHORIZED, "refresh token cannot access APIs").into_response(),
         Err(jwt::JwtError::Expired) => {
             (StatusCode::UNAUTHORIZED, "token expired").into_response()
         }

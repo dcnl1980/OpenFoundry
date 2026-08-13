@@ -45,10 +45,12 @@ async fn main() {
         .expect("failed to run migrations");
 
     let jwt_config = JwtConfig::new(&cfg.jwt_secret);
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("failed to build ontology HTTP client");
+    let tls = service_runtime::TlsSettings::from_env();
+    let http_client = service_runtime::configure_http_client(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)),
+        &tls,
+    )
+    .expect("failed to build ontology HTTP client");
 
     let state = AppState {
         db: pool,
@@ -104,11 +106,8 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     tracing::info!("starting ontology-service on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
+    service_runtime::serve(app, &addr, tls)
         .await
-        .expect("failed to bind");
-
-    axum::serve(listener, app).await.expect("server error");
+        .expect("server error");
 }
 
