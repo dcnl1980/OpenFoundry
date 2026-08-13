@@ -69,5 +69,14 @@ export class ApiError extends Error {
   }
 }
 
+export function emptyOnNotFound<T>(fallback: T): (error: unknown) => T {
+  return (error: unknown) => {
+    if (error instanceof ApiError && error.status === 404) {
+      return fallback;
+    }
+    throw error;
+  };
+}
+
 export const api = new ApiClient();
 export default api;

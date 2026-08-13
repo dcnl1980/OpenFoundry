@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 
+	import { settleList } from '$lib/ai/copilot-context';
 	import { askCopilot, listKnowledgeBases, type CopilotResponse, type KnowledgeBase } from '$lib/api/ai';
 	import { listDatasets, type Dataset } from '$lib/api/datasets';
 	import { notifications } from '$stores/notifications';
+	import { auth } from '$stores/auth';
 	import { copilot } from '$stores/copilot';
 
 	let datasets = $state<Dataset[]>([]);
@@ -24,17 +26,14 @@
 	});
 
 	onMount(async () => {
-		try {
-			const [datasetResponse, knowledgeBaseResponse] = await Promise.all([
-				listDatasets({ per_page: 50 }),
-				listKnowledgeBases(),
-			]);
-			datasets = datasetResponse.data;
-			knowledgeBases = knowledgeBaseResponse.data;
-			selectedKnowledgeBaseIds = knowledgeBaseResponse.data.slice(0, 1).map((item) => item.id);
-		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Failed to load copilot context';
-		}
+		await auth.restore();
+		const [nextDatasets, nextKnowledgeBases] = await Promise.all([
+			settleList(listDatasets({ per_page: 50 })),
+			settleList(listKnowledgeBases()),
+		]);
+		datasets = nextDatasets;
+		knowledgeBases = nextKnowledgeBases;
+		selectedKnowledgeBaseIds = nextKnowledgeBases.slice(0, 1).map((item) => item.id);
 	});
 
 	function toggleSelection(values: string[], id: string) {

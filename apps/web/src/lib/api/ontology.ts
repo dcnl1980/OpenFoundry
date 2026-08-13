@@ -1,4 +1,4 @@
-import api from './client';
+import api, { emptyOnNotFound } from './client';
 
 export interface ObjectType {
   id: string;
@@ -217,7 +217,7 @@ export function executeAction(id: string, body: {
 
 // Properties
 export function listProperties(typeId: string) {
-  return api.get<Property[]>(`/ontology/types/${typeId}/properties`);
+  return api.get<Property[]>(`/ontology/types/${typeId}/properties`).catch(emptyOnNotFound([]));
 }
 
 export function createProperty(typeId: string, body: {
