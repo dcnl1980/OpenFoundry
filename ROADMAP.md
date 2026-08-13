@@ -4,7 +4,7 @@
 
 ### From zero to full Palantir Foundry parity — open source.
 
-*Last updated: April 2026*
+*Last updated: August 2026*
 
 </div>
 
@@ -18,11 +18,13 @@ OpenFoundry aims to deliver **25 core capabilities** that match Palantir Foundry
 
 | Icon | Meaning |
 |------|---------|
-| ✅ | Done — feature shipped and usable |
-| 🚧 | In Progress — actively being built |
+| ✅ | Scaffolded — a service, route, or UI surface exists in this tree. Not a production-readiness claim. |
+| 🚧 | In Progress — actively being built or only partially wired |
 | 📐 | Designed — architecture defined, implementation pending |
 | 🔲 | Planned — scoped but not yet started |
 | 💡 | Exploring — researching approaches |
+
+Milestone checkboxes (`[x]`) mean the named code or page is present. They do **not** mean the feature is complete, hardened, or ready for production.
 
 ### Priority Legend
 
@@ -35,37 +37,37 @@ OpenFoundry aims to deliver **25 core capabilities** that match Palantir Foundry
 
 ---
 
-## 📊 Parity Tracker: 24/25 Foundry Components
+## 📊 Parity Tracker: 24/25 components have a service or UI surface
 
 | # | Foundry Component | OpenFoundry Service | Status | Target Phase |
 |---|---|---|---|---|
-| 1 | Ontology | `ontology-service` | ✅ Done | Phase 1 |
-| 2 | Transforms / Pipeline Builder | `pipeline-service` | ✅ Done | Phase 1 |
-| 3 | Data Connections | `data-connector` | ✅ Done | Phase 1 |
-| 4 | Contour (Visual Analytics) | `query-service` | ✅ Done | Phase 1 |
-| 5 | Dataset Management & Versioning | `dataset-service` | ✅ Done | Phase 1 |
-| 6 | Data Lineage | `pipeline-service/lineage` | ✅ Done | Phase 1 |
-| 7 | Notebooks / Code Workbooks | `notebook-service` | ✅ Done | Phase 1 |
-| 8 | Quiver (Dashboards) | Frontend components | ✅ Done | Phase 2 |
-| 9 | Object Explorer | `ontology-service` | ✅ Done | Phase 1 |
+| 1 | Ontology | `ontology-service` | ✅ Scaffolded | Phase 1 |
+| 2 | Transforms / Pipeline Builder | `pipeline-service` | ✅ Scaffolded | Phase 1 |
+| 3 | Data Connections | `data-connector` | ✅ Scaffolded | Phase 1 |
+| 4 | Contour (Visual Analytics) | `query-service` | ✅ Scaffolded | Phase 1 |
+| 5 | Dataset Management & Versioning | `dataset-service` | ✅ Scaffolded | Phase 1 |
+| 6 | Data Lineage | `pipeline-service/lineage` | ✅ Scaffolded | Phase 1 |
+| 7 | Notebooks / Code Workbooks | `notebook-service` | ✅ Scaffolded | Phase 1 |
+| 8 | Quiver (Dashboards) | Frontend components | ✅ Scaffolded | Phase 2 |
+| 9 | Object Explorer | `ontology-service` | ✅ Scaffolded | Phase 1 |
 | 10 | Auth / RBAC / SSO | `auth-service` | 🚧 In Progress | Phase 2 |
-| 11 | Workflows / Actions | `workflow-service` | ✅ Done | Phase 2 |
-| 12 | Notifications | `notification-service` | ✅ Done | Phase 2 |
-| 13 | Data Catalog | `dataset-service/catalog` | ✅ Done | Phase 2 |
-| 14 | Data Quality | `dataset-service/quality` | ✅ Done | Phase 2 |
-| 15 | Slate/Workshop (App Builder) | `app-builder-service` | ✅ Done | Phase 3 |
-| 16 | ML / Model Management | `ml-service` | ✅ Done | Phase 3 |
-| 17 | AIP (GenAI / LLM / Copilot) | `ai-service` | ✅ Done | Phase 3 |
-| 18 | Reports | `report-service` | ✅ Done | Phase 4 |
-| 19 | Fusion (Entity Resolution) | `fusion-service` | ✅ Done | Phase 4 |
-| 20 | Code Repositories (Git) | `code-repo-service` | ✅ Done | Phase 4 |
-| 21 | Marketplace | `marketplace-service` | ✅ Done | Phase 4 |
-| 22 | Streaming (Real-time) | `streaming-service` | ✅ Done | Phase 4 |
-| 23 | Geospatial / Maps | `geospatial-service` | ✅ Done | Phase 4 |
-| 24 | Audit & Compliance | `audit-service` | ✅ Done | Phase 4 |
-| 25 | Nexus (Cross-org Sharing) | `nexus-service` | ✅ Done | Phase 5 |
+| 11 | Workflows / Actions | `workflow-service` | ✅ Scaffolded | Phase 2 |
+| 12 | Notifications | `notification-service` | ✅ Scaffolded | Phase 2 |
+| 13 | Data Catalog | `dataset-service/catalog` | ✅ Scaffolded | Phase 2 |
+| 14 | Data Quality | `dataset-service/quality` | ✅ Scaffolded | Phase 2 |
+| 15 | Slate/Workshop (App Builder) | `app-builder-service` | ✅ Scaffolded | Phase 3 |
+| 16 | ML / Model Management | `ml-service` | ✅ Scaffolded | Phase 3 |
+| 17 | AIP (GenAI / LLM / Copilot) | `ai-service` | ✅ Scaffolded | Phase 3 |
+| 18 | Reports | `report-service` | ✅ Scaffolded | Phase 4 |
+| 19 | Fusion (Entity Resolution) | `fusion-service` | ✅ Scaffolded | Phase 4 |
+| 20 | Code Repositories (Git) | `code-repo-service` | ✅ Scaffolded | Phase 4 |
+| 21 | Marketplace | `marketplace-service` | ✅ Scaffolded | Phase 4 |
+| 22 | Streaming (Real-time) | `streaming-service` | ✅ Scaffolded | Phase 4 |
+| 23 | Geospatial / Maps | `geospatial-service` | ✅ Scaffolded | Phase 4 |
+| 24 | Audit & Compliance | `audit-service` | ✅ Scaffolded | Phase 4 |
+| 25 | Nexus (Cross-org Sharing) | `nexus-service` | ✅ Scaffolded | Phase 5 |
 
-Current repo audit: 24 components are shipped. Enterprise auth remains the only partial component because OIDC is implemented, while SAML sign-in flow is still pending.
+Current repo audit: 24 of 25 Foundry-shaped components have a crate and/or UI route. That is coverage of the map, not feature-complete parity. Auth is the only row marked in progress (OIDC exists; SAML sign-in is still pending). The gateway control hop (auth allowlist, trusted headers, audit, Redis-backed rate limits with memory fallback, streamed bodies) is production-oriented; domain services behind it are still scaffolded.
 
 ---
 
@@ -289,8 +291,8 @@ Current repo audit: 24 components are shipped. Enterprise auth remains the only 
 - [x] **Retention policies** — Configurable TTL for audit events
 - [x] **Frontend: Audit log viewer, compliance dashboard, policy manager**
 
-**Phase 4 exit criteria:**
-> The platform has full feature parity with Palantir Foundry for all 24 of 25 components, suitable for enterprise production use.
+**Phase 4 exit criteria (target, not current state):**
+> The platform has production-ready coverage of the remaining Foundry-shaped capabilities — entity resolution, streaming, geospatial, code repos, marketplace, reports, and audit — not merely a service stub for each.
 
 ---
 
@@ -330,7 +332,7 @@ Current repo audit: 24 components are shipped. Enterprise auth remains the only 
 - [x] **Global CDN** — Tile server and static asset caching at the edge
 - [x] **Benchmark suite** — Reproducible benchmarks for all critical paths
 
-**Phase 5 exit criteria:**
+**Phase 5 exit criteria (target, not current state):**
 > Organizations can share data securely across boundaries, third-party developers can extend the platform, and the system scales to enterprise workloads.
 
 ---

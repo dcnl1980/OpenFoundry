@@ -8,6 +8,12 @@ pub struct GatewayConfig {
     pub port: u16,
     pub jwt_secret: String,
     #[serde(default)]
+    pub redis_url: Option<String>,
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
+    #[serde(default = "default_anonymous_rpm")]
+    pub anonymous_requests_per_minute: u32,
+    #[serde(default)]
     pub cors_origins: Vec<String>,
     #[serde(default = "default_auth_url")]
     pub auth_service_url: String,
@@ -45,6 +51,10 @@ pub struct GatewayConfig {
     pub audit_service_url: String,
     #[serde(default = "default_nexus_service_url")]
     pub nexus_service_url: String,
+}
+
+fn default_anonymous_rpm() -> u32 {
+    60
 }
 
 fn default_host() -> String {
