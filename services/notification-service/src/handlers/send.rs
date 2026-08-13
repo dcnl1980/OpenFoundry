@@ -6,9 +6,12 @@ use axum::{
 };
 use lettre::{message::Mailbox, AsyncTransport, Message};
 use serde_json::{json, Value};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
+	handlers::tenant::begin_scope,
 	models::{
 		notification::{NotificationDelivery, NotificationEvent, NotificationRecord, SendNotificationRequest},
 		subscription::NotificationPreference,
@@ -16,11 +19,14 @@ use crate::{
 	AppState,
 };
 
+const PLACEHOLDER_TENANT: Uuid = Uuid::from_u128(1);
+
 pub async fn internal_send_notification(
 	State(state): State<AppState>,
 	Json(body): Json<SendNotificationRequest>,
 ) -> impl IntoResponse {
-	match create_notification(&state, body).await {
+	let tenant_id = body.user_id.unwrap_or(PLACEHOLDER_TENANT);
+	match create_notification(&state, tenant_id, body).await {
 		Ok(notification) => (StatusCode::CREATED, Json(notification)).into_response(),
 		Err(error) => (
 			StatusCode::INTERNAL_SERVER_ERROR,
@@ -32,14 +38,18 @@ pub async fn internal_send_notification(
 
 pub async fn send_notification(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(mut body): Json<SendNotificationRequest>,
 ) -> impl IntoResponse {
 	if body.user_id.is_none() {
 		body.user_id = Some(claims.sub);
 	}
+	let _scope = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 
-	match create_notification(&state, body).await {
+	match create_notification(&state, claims.tenant_scope_id(), body).await {
 		Ok(notification) => (StatusCode::CREATED, Json(notification)).into_response(),
 		Err(error) => (
 			StatusCode::INTERNAL_SERVER_ERROR,
@@ -51,8 +61,12 @@ pub async fn send_notification(
 
 pub async fn create_notification(
 	state: &AppState,
+	tenant_id: Uuid,
 	body: SendNotificationRequest,
 ) -> Result<NotificationRecord, String> {
+	let mut tx = auth_middleware::begin_tenant_transaction(&state.db, tenant_id)
+		.await
+		.map_err(|error| error.to_string())?;
 	let channels = body
 		.channels
 		.unwrap_or_else(|| vec!["in_app".to_string()]);
@@ -60,9 +74,9 @@ pub async fn create_notification(
 
 	let notification = sqlx::query_as::<_, NotificationRecord>(
 		r#"INSERT INTO notifications (
-			   id, user_id, title, body, category, severity, status, channels, metadata
+			   id, user_id, title, body, category, severity, status, channels, metadata, tenant_id
 		   )
-		   VALUES ($1, $2, $3, $4, $5, $6, 'unread', $7, $8)
+		   VALUES ($1, $2, $3, $4, $5, $6, 'unread', $7, $8, $9)
 		   RETURNING *"#,
 	)
 	.bind(Uuid::now_v7())
@@ -73,15 +87,17 @@ pub async fn create_notification(
 	.bind(body.severity.as_deref().unwrap_or("info"))
 	.bind(serde_json::to_value(&channels).map_err(|error| error.to_string())?)
 	.bind(&metadata)
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|error| error.to_string())?;
 
-	let preference = load_preferences(state, body.user_id).await?;
+	let preference = load_preferences(&mut tx, body.user_id).await?;
 
 	for channel in channels {
 		record_delivery(
-			state,
+			&mut tx,
+			tenant_id,
 			&notification,
 			&channel,
 			dispatch_channel(state, &notification, preference.as_ref(), &channel).await,
@@ -89,7 +105,8 @@ pub async fn create_notification(
 		.await?;
 	}
 
-	let unread_count = unread_count(state, notification.user_id).await.unwrap_or(0);
+	let unread_count = unread_count(&mut tx, notification.user_id).await.unwrap_or(0);
+	tx.commit().await.map_err(|error| error.to_string())?;
 	let _ = state.notification_bus.send(NotificationEvent {
 		kind: "notification.created".to_string(),
 		user_id: notification.user_id,
@@ -101,7 +118,7 @@ pub async fn create_notification(
 }
 
 pub async fn unread_count(
-	state: &AppState,
+	tx: &mut Transaction<'_, Postgres>,
 	user_id: Option<Uuid>,
 ) -> Result<i64, sqlx::Error> {
 	sqlx::query_scalar::<_, i64>(
@@ -110,12 +127,12 @@ pub async fn unread_count(
 			 AND (($1::UUID IS NULL AND user_id IS NULL) OR user_id = $1 OR user_id IS NULL)"#,
 	)
 	.bind(user_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut **tx)
 	.await
 }
 
 pub async fn latest_notifications(
-	state: &AppState,
+	tx: &mut Transaction<'_, Postgres>,
 	user_id: Uuid,
 	limit: i64,
 ) -> Result<Vec<NotificationRecord>, sqlx::Error> {
@@ -127,12 +144,12 @@ pub async fn latest_notifications(
 	)
 	.bind(user_id)
 	.bind(limit)
-	.fetch_all(&state.db)
+	.fetch_all(&mut **tx)
 	.await
 }
 
 async fn load_preferences(
-	state: &AppState,
+	tx: &mut Transaction<'_, Postgres>,
 	user_id: Option<Uuid>,
 ) -> Result<Option<NotificationPreference>, String> {
 	let Some(user_id) = user_id else {
@@ -143,7 +160,7 @@ async fn load_preferences(
 		r#"SELECT * FROM notification_preferences WHERE user_id = $1"#,
 	)
 	.bind(user_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await
 	.map_err(|error| error.to_string())
 }
@@ -243,14 +260,15 @@ async fn post_webhook(state: &AppState, url: &str, payload: Value) -> DeliveryRe
 }
 
 async fn record_delivery(
-	state: &AppState,
+	tx: &mut Transaction<'_, Postgres>,
+	tenant_id: Uuid,
 	notification: &NotificationRecord,
 	channel: &str,
 	result: DeliveryResult,
 ) -> Result<NotificationDelivery, String> {
 	sqlx::query_as::<_, NotificationDelivery>(
-		r#"INSERT INTO notification_deliveries (id, notification_id, channel, status, response)
-		   VALUES ($1, $2, $3, $4, $5)
+		r#"INSERT INTO notification_deliveries (id, notification_id, channel, status, response, tenant_id)
+		   VALUES ($1, $2, $3, $4, $5, $6)
 		   RETURNING *"#,
 	)
 	.bind(Uuid::now_v7())
@@ -258,7 +276,8 @@ async fn record_delivery(
 	.bind(channel)
 	.bind(result.status)
 	.bind(result.response)
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut **tx)
 	.await
 	.map_err(|error| error.to_string())
 }

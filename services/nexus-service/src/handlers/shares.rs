@@ -1,9 +1,13 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::{encryption, schema_compat},
-	handlers::{bad_request, db_error, internal_error, load_access_grants, load_contract_row, load_contracts, load_peer_row, load_share_row, load_shares, load_sync_statuses, not_found, ServiceResult},
+	handlers::{
+		bad_request, commit_scope, db_error, internal_error, load_access_grants, load_contract_row, load_contracts,
+		load_peer_row, load_share_row, load_shares, load_sync_statuses, not_found, open_scope, ServiceResult,
+	},
 	models::{
 		access_grant::AccessGrant,
 		share::{CreateShareRequest, ShareDetail, SharedDataset, UpdateShareRequest},
@@ -13,11 +17,16 @@ use crate::{
 	AppState,
 };
 
-pub async fn list_shares(State(state): State<AppState>) -> ServiceResult<ListResponse<ShareDetail>> {
-	let shares = load_shares(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let contracts = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let grants = load_access_grants(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let sync_statuses = load_sync_statuses(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_shares(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<ShareDetail>> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let shares = load_shares(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let contracts = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let grants = load_access_grants(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let sync_statuses = load_sync_statuses(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 
 	let items = shares
 		.iter()
@@ -30,40 +39,45 @@ pub async fn list_shares(State(state): State<AppState>) -> ServiceResult<ListRes
 pub async fn get_share(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ShareDetail> {
-	let row = load_share_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let row = load_share_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("shared dataset not found"))?;
 	let share = SharedDataset::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
-	let contracts = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let grants = load_access_grants(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let sync_statuses = load_sync_statuses(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let contracts = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let grants = load_access_grants(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let sync_statuses = load_sync_statuses(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(compose_share_detail(&share, &contracts, &grants, &sync_statuses)))
 }
 
 pub async fn create_share(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateShareRequest>,
 ) -> ServiceResult<ShareDetail> {
 	if request.dataset_name.trim().is_empty() {
 		return Err(bad_request("dataset name is required"));
 	}
 
-	let contract_row = load_contract_row(&state.db, request.contract_id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let contract_row = load_contract_row(&mut *tx, request.contract_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| bad_request("contract not found"))?;
 	let contract = crate::models::contract::SharingContract::try_from(contract_row)
 		.map_err(|cause| internal_error(cause.to_string()))?;
-	if load_peer_row(&state.db, request.provider_peer_id)
+	if load_peer_row(&mut *tx, request.provider_peer_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.is_none()
 	{
 		return Err(bad_request("provider peer not found"));
 	}
-	if load_peer_row(&state.db, request.consumer_peer_id)
+	if load_peer_row(&mut *tx, request.consumer_peer_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.is_none()
@@ -80,10 +94,11 @@ pub async fn create_share(
 	let consumer_schema = request.consumer_schema.clone();
 	let sample_rows = serde_json::to_value(&request.sample_rows).map_err(|cause| internal_error(cause.to_string()))?;
 	let allowed_purposes = serde_json::to_value(&contract.allowed_purposes).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO nexus_shares (id, contract_id, provider_peer_id, consumer_peer_id, dataset_name, selector, provider_schema, consumer_schema, sample_rows, replication_mode, status, last_sync_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)",
+		"INSERT INTO nexus_shares (id, contract_id, provider_peer_id, consumer_peer_id, dataset_name, selector, provider_schema, consumer_schema, sample_rows, replication_mode, status, last_sync_at, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15)",
 	)
 	.bind(id)
 	.bind(request.contract_id)
@@ -99,13 +114,14 @@ pub async fn create_share(
 	.bind(Option::<chrono::DateTime<chrono::Utc>>::None)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
 	sqlx::query(
-		"INSERT INTO nexus_access_grants (id, share_id, peer_id, query_template, max_rows_per_query, can_replicate, allowed_purposes, expires_at, issued_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)",
+		"INSERT INTO nexus_access_grants (id, share_id, peer_id, query_template, max_rows_per_query, can_replicate, allowed_purposes, expires_at, issued_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)",
 	)
 	.bind(grant_id)
 	.bind(id)
@@ -116,13 +132,14 @@ pub async fn create_share(
 	.bind(allowed_purposes)
 	.bind(contract.expires_at)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
 	sqlx::query(
-		"INSERT INTO nexus_sync_statuses (id, share_id, mode, status, rows_replicated, backlog_rows, encrypted_in_transit, encrypted_at_rest, key_version, last_sync_at, next_sync_at, audit_cursor, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+		"INSERT INTO nexus_sync_statuses (id, share_id, mode, status, rows_replicated, backlog_rows, encrypted_in_transit, encrypted_at_rest, key_version, last_sync_at, next_sync_at, audit_cursor, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 	)
 	.bind(sync_id)
 	.bind(id)
@@ -137,27 +154,31 @@ pub async fn create_share(
 	.bind(Some(now + chrono::Duration::hours(4)))
 	.bind(format!("cursor/{}", id))
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_share_row(&state.db, id)
+	let row = load_share_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created share could not be reloaded"))?;
 	let share = SharedDataset::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
-	let contracts = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let grants = load_access_grants(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let sync_statuses = load_sync_statuses(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let contracts = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let grants = load_access_grants(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let sync_statuses = load_sync_statuses(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(compose_share_detail(&share, &contracts, &grants, &sync_statuses)))
 }
 
 pub async fn update_share(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateShareRequest>,
 ) -> ServiceResult<ShareDetail> {
-	let current = load_share_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let current = load_share_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("shared dataset not found"))?;
@@ -185,18 +206,19 @@ pub async fn update_share(
 	.bind(request.replication_mode.unwrap_or(current.replication_mode))
 	.bind(request.status.unwrap_or(current.status))
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_share_row(&state.db, id)
+	let row = load_share_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated share could not be reloaded"))?;
 	let share = SharedDataset::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
-	let contracts = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let grants = load_access_grants(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let sync_statuses = load_sync_statuses(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let contracts = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let grants = load_access_grants(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let sync_statuses = load_sync_statuses(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(compose_share_detail(&share, &contracts, &grants, &sync_statuses)))
 }
 

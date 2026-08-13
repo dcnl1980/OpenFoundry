@@ -36,6 +36,8 @@ pub struct InstallRow {
 	pub dependency_plan: Value,
 	pub installed_at: DateTime<Utc>,
 	pub ready_at: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<InstallRow> for InstallRecord {

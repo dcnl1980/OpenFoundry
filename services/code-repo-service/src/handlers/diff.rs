@@ -1,8 +1,9 @@
 use axum::{extract::{Path, Query, State}, Json};
 use serde::Deserialize;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
-	handlers::{db_error, load_commits, load_files, load_repository_row, not_found, ServiceResult},
+	handlers::{commit_scope, db_error, load_commits, load_files, load_repository_row, not_found, open_scope, ServiceResult},
 	models::file::DiffResponse,
 	AppState,
 };
@@ -16,15 +17,18 @@ pub async fn get_repository_diff(
 	Path(id): Path<uuid::Uuid>,
 	Query(query): Query<DiffQuery>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<DiffResponse> {
-	let repository = load_repository_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let repository = load_repository_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("repository not found"))?;
 	let repository = crate::models::repository::RepositoryDefinition::try_from(repository)
 		.map_err(|cause| crate::handlers::internal_error(cause.to_string()))?;
-	let files = load_files(&state.db, id).await.map_err(|cause| db_error(&cause))?;
-	let commits = load_commits(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let files = load_files(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	let commits = load_commits(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	let branch_name = query.branch.unwrap_or(repository.default_branch);
 	let patch = crate::domain::git::repository_diff(&files, &branch_name, &commits);
 	Ok(Json(DiffResponse { branch_name, patch }))

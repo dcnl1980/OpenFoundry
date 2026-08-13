@@ -28,6 +28,8 @@ pub struct AccessGrantRow {
 	pub allowed_purposes: Value,
 	pub expires_at: DateTime<Utc>,
 	pub issued_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: uuid::Uuid,
 }
 
 impl TryFrom<AccessGrantRow> for AccessGrant {

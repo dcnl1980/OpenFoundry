@@ -2,6 +2,7 @@ pub mod consume;
 pub mod contracts;
 pub mod peers;
 pub mod shares;
+pub mod tenant;
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
@@ -38,14 +39,28 @@ pub fn db_error(cause: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
 	internal_error("database operation failed")
 }
 
-pub async fn load_peers(db: &sqlx::PgPool) -> Result<Vec<crate::models::peer::PeerOrganization>, sqlx::Error> {
-	let rows = sqlx::query_as::<_, PeerRow>(
-		"SELECT id, slug, display_name, region, endpoint_url, auth_mode, trust_level, public_key_fingerprint, shared_scopes, status, last_handshake_at, created_at, updated_at
-		 FROM nexus_peers
-		 ORDER BY updated_at DESC",
-	)
-	.fetch_all(db)
-	.await?;
+pub async fn open_scope<'a>(
+	state: &'a crate::AppState,
+	claims: &auth_middleware::Claims,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>, (StatusCode, Json<ErrorResponse>)> {
+	tenant::begin_scope(state, claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))
+}
+
+pub async fn commit_scope(
+	tx: sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+	tx.commit().await.map_err(|cause| db_error(&cause))
+}
+
+pub async fn load_peers<'e, E>(db: E) -> Result<Vec<crate::models::peer::PeerOrganization>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	let rows = sqlx::query_as::<_, PeerRow>("SELECT * FROM nexus_peers ORDER BY updated_at DESC")
+		.fetch_all(db)
+		.await?;
 
 	rows.into_iter()
 		.map(crate::models::peer::PeerOrganization::try_from)
@@ -53,24 +68,23 @@ pub async fn load_peers(db: &sqlx::PgPool) -> Result<Vec<crate::models::peer::Pe
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_peer_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<PeerRow>, sqlx::Error> {
-	sqlx::query_as::<_, PeerRow>(
-		"SELECT id, slug, display_name, region, endpoint_url, auth_mode, trust_level, public_key_fingerprint, shared_scopes, status, last_handshake_at, created_at, updated_at
-		 FROM nexus_peers WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_optional(db)
-	.await
+pub async fn load_peer_row<'e, E>(db: E, id: uuid::Uuid) -> Result<Option<PeerRow>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	sqlx::query_as::<_, PeerRow>("SELECT * FROM nexus_peers WHERE id = $1")
+		.bind(id)
+		.fetch_optional(db)
+		.await
 }
 
-pub async fn load_contracts(db: &sqlx::PgPool) -> Result<Vec<crate::models::contract::SharingContract>, sqlx::Error> {
-	let rows = sqlx::query_as::<_, ContractRow>(
-		"SELECT id, peer_id, name, description, dataset_locator, allowed_purposes, data_classes, residency_region, query_template, max_rows_per_query, replication_mode, encryption_profile, retention_days, status, signed_at, expires_at, created_at, updated_at
-		 FROM nexus_contracts
-		 ORDER BY updated_at DESC",
-	)
-	.fetch_all(db)
-	.await?;
+pub async fn load_contracts<'e, E>(db: E) -> Result<Vec<crate::models::contract::SharingContract>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	let rows = sqlx::query_as::<_, ContractRow>("SELECT * FROM nexus_contracts ORDER BY updated_at DESC")
+		.fetch_all(db)
+		.await?;
 
 	rows.into_iter()
 		.map(crate::models::contract::SharingContract::try_from)
@@ -78,24 +92,23 @@ pub async fn load_contracts(db: &sqlx::PgPool) -> Result<Vec<crate::models::cont
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_contract_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<ContractRow>, sqlx::Error> {
-	sqlx::query_as::<_, ContractRow>(
-		"SELECT id, peer_id, name, description, dataset_locator, allowed_purposes, data_classes, residency_region, query_template, max_rows_per_query, replication_mode, encryption_profile, retention_days, status, signed_at, expires_at, created_at, updated_at
-		 FROM nexus_contracts WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_optional(db)
-	.await
+pub async fn load_contract_row<'e, E>(db: E, id: uuid::Uuid) -> Result<Option<ContractRow>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	sqlx::query_as::<_, ContractRow>("SELECT * FROM nexus_contracts WHERE id = $1")
+		.bind(id)
+		.fetch_optional(db)
+		.await
 }
 
-pub async fn load_shares(db: &sqlx::PgPool) -> Result<Vec<crate::models::share::SharedDataset>, sqlx::Error> {
-	let rows = sqlx::query_as::<_, SharedDatasetRow>(
-		"SELECT id, contract_id, provider_peer_id, consumer_peer_id, dataset_name, selector, provider_schema, consumer_schema, sample_rows, replication_mode, status, last_sync_at, created_at, updated_at
-		 FROM nexus_shares
-		 ORDER BY updated_at DESC",
-	)
-	.fetch_all(db)
-	.await?;
+pub async fn load_shares<'e, E>(db: E) -> Result<Vec<crate::models::share::SharedDataset>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	let rows = sqlx::query_as::<_, SharedDatasetRow>("SELECT * FROM nexus_shares ORDER BY updated_at DESC")
+		.fetch_all(db)
+		.await?;
 
 	rows.into_iter()
 		.map(crate::models::share::SharedDataset::try_from)
@@ -103,24 +116,23 @@ pub async fn load_shares(db: &sqlx::PgPool) -> Result<Vec<crate::models::share::
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_share_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<SharedDatasetRow>, sqlx::Error> {
-	sqlx::query_as::<_, SharedDatasetRow>(
-		"SELECT id, contract_id, provider_peer_id, consumer_peer_id, dataset_name, selector, provider_schema, consumer_schema, sample_rows, replication_mode, status, last_sync_at, created_at, updated_at
-		 FROM nexus_shares WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_optional(db)
-	.await
+pub async fn load_share_row<'e, E>(db: E, id: uuid::Uuid) -> Result<Option<SharedDatasetRow>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	sqlx::query_as::<_, SharedDatasetRow>("SELECT * FROM nexus_shares WHERE id = $1")
+		.bind(id)
+		.fetch_optional(db)
+		.await
 }
 
-pub async fn load_access_grants(db: &sqlx::PgPool) -> Result<Vec<crate::models::access_grant::AccessGrant>, sqlx::Error> {
-	let rows = sqlx::query_as::<_, AccessGrantRow>(
-		"SELECT id, share_id, peer_id, query_template, max_rows_per_query, can_replicate, allowed_purposes, expires_at, issued_at
-		 FROM nexus_access_grants
-		 ORDER BY issued_at DESC",
-	)
-	.fetch_all(db)
-	.await?;
+pub async fn load_access_grants<'e, E>(db: E) -> Result<Vec<crate::models::access_grant::AccessGrant>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	let rows = sqlx::query_as::<_, AccessGrantRow>("SELECT * FROM nexus_access_grants ORDER BY issued_at DESC")
+		.fetch_all(db)
+		.await?;
 
 	rows.into_iter()
 		.map(crate::models::access_grant::AccessGrant::try_from)
@@ -128,14 +140,13 @@ pub async fn load_access_grants(db: &sqlx::PgPool) -> Result<Vec<crate::models::
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_sync_statuses(db: &sqlx::PgPool) -> Result<Vec<crate::models::sync_status::SyncStatus>, sqlx::Error> {
-	let rows = sqlx::query_as::<_, SyncStatusRow>(
-		"SELECT id, share_id, mode, status, rows_replicated, backlog_rows, encrypted_in_transit, encrypted_at_rest, key_version, last_sync_at, next_sync_at, audit_cursor, updated_at
-		 FROM nexus_sync_statuses
-		 ORDER BY updated_at DESC",
-	)
-	.fetch_all(db)
-	.await?;
+pub async fn load_sync_statuses<'e, E>(db: E) -> Result<Vec<crate::models::sync_status::SyncStatus>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	let rows = sqlx::query_as::<_, SyncStatusRow>("SELECT * FROM nexus_sync_statuses ORDER BY updated_at DESC")
+		.fetch_all(db)
+		.await?;
 
 	rows.into_iter()
 		.map(crate::models::sync_status::SyncStatus::try_from)

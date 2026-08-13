@@ -98,6 +98,8 @@ pub struct ListingRow {
 	pub average_rating: f64,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<ListingRow> for ListingDefinition {

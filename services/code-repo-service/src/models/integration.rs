@@ -140,6 +140,8 @@ pub struct IntegrationRow {
 	pub last_synced_at: Option<DateTime<Utc>>,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -155,6 +157,8 @@ pub struct SyncRunRow {
 	pub checks: Value,
 	pub started_at: DateTime<Utc>,
 	pub completed_at: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<IntegrationRow> for RepositoryIntegration {

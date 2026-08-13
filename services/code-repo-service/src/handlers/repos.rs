@@ -1,8 +1,9 @@
 use axum::{extract::State, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
-	handlers::{db_error, internal_error, load_all_repositories, load_merge_requests, ServiceResult},
+	handlers::{commit_scope, db_error, internal_error, load_all_repositories, load_merge_requests, open_scope, ServiceResult},
 	models::{
 		repository::{CreateRepositoryRequest, RepositoryDefinition, RepositoryOverview, UpdateRepositoryRequest},
 		ListResponse,
@@ -10,9 +11,14 @@ use crate::{
 	AppState,
 };
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<RepositoryOverview> {
-	let repositories = load_all_repositories(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let merge_requests = load_merge_requests(&state.db, None).await.map_err(|cause| db_error(&cause))?;
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<RepositoryOverview> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let repositories = load_all_repositories(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let merge_requests = load_merge_requests(&mut *tx, None).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 
 	Ok(Json(RepositoryOverview {
 		repository_count: repositories.len(),
@@ -23,26 +29,34 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<Reposi
 	}))
 }
 
-pub async fn list_repositories(State(state): State<AppState>) -> ServiceResult<ListResponse<RepositoryDefinition>> {
-	let repositories = load_all_repositories(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_repositories(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<RepositoryDefinition>> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let repositories = load_all_repositories(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items: repositories }))
 }
 
 pub async fn create_repository(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateRepositoryRequest>,
 ) -> ServiceResult<RepositoryDefinition> {
 	if request.name.trim().is_empty() {
 		return Err(crate::handlers::bad_request("repository name is required"));
 	}
 
+	let mut tx = open_scope(&state, &claims).await?;
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let tags = serde_json::to_value(&request.tags).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO code_repositories (id, name, slug, description, owner, default_branch, visibility, object_store_backend, package_kind, tags, settings, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13)",
+		"INSERT INTO code_repositories (id, name, slug, description, owner, default_branch, visibility, object_store_backend, package_kind, tags, settings, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)",
 	)
 	.bind(id)
 	.bind(&request.name)
@@ -57,14 +71,15 @@ pub async fn create_repository(
 	.bind(request.settings)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
 	for file in crate::domain::git::default_repository_files(id, &request.default_branch) {
 		sqlx::query(
-			"INSERT INTO code_repository_files (id, repository_id, path, branch_name, language, size_bytes, content, last_commit_sha)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+			"INSERT INTO code_repository_files (id, repository_id, path, branch_name, language, size_bytes, content, last_commit_sha, tenant_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 		)
 		.bind(file.id)
 		.bind(file.repository_id)
@@ -74,27 +89,29 @@ pub async fn create_repository(
 		.bind(file.size_bytes)
 		.bind(&file.content)
 		.bind(&file.last_commit_sha)
-		.execute(&state.db)
+		.bind(tenant_id)
+		.execute(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	}
 
 	sqlx::query(
-		"INSERT INTO code_repository_branches (id, repository_id, name, head_sha, base_branch, is_default, protected, ahead_by, pending_reviews, updated_at)
-		 VALUES ($1, $2, $3, $4, NULL, true, true, 0, 0, $5)",
+		"INSERT INTO code_repository_branches (id, repository_id, name, head_sha, base_branch, is_default, protected, ahead_by, pending_reviews, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, NULL, true, true, 0, 0, $5, $6)",
 	)
 	.bind(uuid::Uuid::now_v7())
 	.bind(id)
 	.bind(&request.default_branch)
 	.bind("init000")
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
 	sqlx::query(
-		"INSERT INTO code_repository_commits (id, repository_id, branch_name, sha, parent_sha, title, description, author_name, author_email, files_changed, additions, deletions, created_at)
-		 VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11, $12)",
+		"INSERT INTO code_repository_commits (id, repository_id, branch_name, sha, parent_sha, title, description, author_name, author_email, files_changed, additions, deletions, created_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
 	)
 	.bind(uuid::Uuid::now_v7())
 	.bind(id)
@@ -108,14 +125,16 @@ pub async fn create_repository(
 	.bind(42)
 	.bind(0)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = crate::handlers::load_repository_row(&state.db, id)
+	let row = crate::handlers::load_repository_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created repository could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let repository = RepositoryDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(repository))
 }
@@ -123,9 +142,11 @@ pub async fn create_repository(
 pub async fn update_repository(
 	axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateRepositoryRequest>,
 ) -> ServiceResult<RepositoryDefinition> {
-	let row = crate::handlers::load_repository_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let row = crate::handlers::load_repository_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| crate::handlers::not_found("repository not found"))?;
@@ -162,14 +183,15 @@ pub async fn update_repository(
 	.bind(tags)
 	.bind(&repository.settings)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = crate::handlers::load_repository_row(&state.db, id)
+	let row = crate::handlers::load_repository_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated repository could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let repository = RepositoryDefinition::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(repository))
 }

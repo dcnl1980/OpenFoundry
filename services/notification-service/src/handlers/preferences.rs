@@ -5,18 +5,32 @@ use axum::{
 	Json,
 };
 use serde_json::json;
+use auth_middleware::layer::AuthUser;
+use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::{
+	handlers::tenant::begin_scope,
 	models::subscription::{NotificationPreference, UpdateNotificationPreferenceRequest},
 	AppState,
 };
 
 pub async fn get_preferences(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 ) -> impl IntoResponse {
-	match load_or_default_preferences(&state, claims.sub).await {
-		Ok(preferences) => Json(preferences).into_response(),
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	match load_or_default_preferences(&mut tx, claims.sub, claims.tenant_scope_id()).await {
+		Ok(preferences) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("get notification preferences commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(preferences).into_response()
+		}
 		Err(error) => {
 			tracing::error!("get notification preferences failed: {error}");
 			StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -26,22 +40,27 @@ pub async fn get_preferences(
 
 pub async fn update_preferences(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<UpdateNotificationPreferenceRequest>,
 ) -> impl IntoResponse {
-	let current = match load_or_default_preferences(&state, claims.sub).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let current = match load_or_default_preferences(&mut tx, claims.sub, claims.tenant_scope_id()).await {
 		Ok(preferences) => preferences,
 		Err(error) => {
 			tracing::error!("load current notification preferences failed: {error}");
 			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 		}
 	};
+	let tenant_id = claims.tenant_scope_id();
 
 	let updated = sqlx::query_as::<_, NotificationPreference>(
 		r#"INSERT INTO notification_preferences (
-			   user_id, in_app_enabled, email_enabled, email_address, slack_webhook_url, teams_webhook_url, digest_frequency, quiet_hours
+			   user_id, in_app_enabled, email_enabled, email_address, slack_webhook_url, teams_webhook_url, digest_frequency, quiet_hours, tenant_id
 		   )
-		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		   ON CONFLICT (user_id)
 		   DO UPDATE SET
 			   in_app_enabled = EXCLUDED.in_app_enabled,
@@ -51,6 +70,7 @@ pub async fn update_preferences(
 			   teams_webhook_url = EXCLUDED.teams_webhook_url,
 			   digest_frequency = EXCLUDED.digest_frequency,
 			   quiet_hours = EXCLUDED.quiet_hours,
+			   tenant_id = EXCLUDED.tenant_id,
 			   updated_at = NOW()
 		   RETURNING *"#,
 	)
@@ -62,11 +82,18 @@ pub async fn update_preferences(
 	.bind(body.teams_webhook_url.or(current.teams_webhook_url))
 	.bind(body.digest_frequency.unwrap_or(current.digest_frequency))
 	.bind(body.quiet_hours.unwrap_or(current.quiet_hours))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await;
 
 	match updated {
-		Ok(preferences) => Json(preferences).into_response(),
+		Ok(preferences) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("update notification preferences commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(preferences).into_response()
+		}
 		Err(error) => {
 			tracing::error!("update notification preferences failed: {error}");
 			(StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response()
@@ -75,14 +102,15 @@ pub async fn update_preferences(
 }
 
 pub async fn load_or_default_preferences(
-	state: &AppState,
-	user_id: uuid::Uuid,
+	tx: &mut Transaction<'_, Postgres>,
+	user_id: Uuid,
+	tenant_id: Uuid,
 ) -> Result<NotificationPreference, sqlx::Error> {
 	let existing = sqlx::query_as::<_, NotificationPreference>(
 		r#"SELECT * FROM notification_preferences WHERE user_id = $1"#,
 	)
 	.bind(user_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await?;
 
 	if let Some(existing) = existing {
@@ -98,6 +126,7 @@ pub async fn load_or_default_preferences(
 			digest_frequency: "instant".to_string(),
 			quiet_hours: json!({}),
 			updated_at: chrono::Utc::now(),
+			tenant_id,
 		})
 	}
 }

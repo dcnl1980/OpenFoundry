@@ -51,6 +51,8 @@ pub struct SharedDatasetRow {
 	pub last_sync_at: Option<DateTime<Utc>>,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: uuid::Uuid,
 }
 
 impl TryFrom<SharedDatasetRow> for SharedDataset {

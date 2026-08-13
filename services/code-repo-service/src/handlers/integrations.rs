@@ -1,11 +1,12 @@
 use axum::{extract::{Path, Query, State}, Json};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	handlers::{
-		bad_request, db_error, internal_error, load_integration_row, load_integrations, load_repository_row,
-		load_sync_runs, not_found, ServiceResult,
+		bad_request, commit_scope, db_error, internal_error, load_integration_row, load_integrations, load_repository_row,
+		load_sync_runs, not_found, open_scope, ServiceResult,
 	},
 	models::{
 		integration::{
@@ -25,33 +26,41 @@ pub struct IntegrationQuery {
 pub async fn list_integrations(
 	Query(query): Query<IntegrationQuery>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<RepositoryIntegration>> {
-	let items = load_integrations(&state.db, query.repository_id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	let items = load_integrations(&mut *tx, query.repository_id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items }))
 }
 
 pub async fn get_integration(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<IntegrationDetail> {
-	let row = load_integration_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let row = load_integration_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("integration not found"))?;
 	let integration = RepositoryIntegration::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
-	let sync_runs = load_sync_runs(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let sync_runs = load_sync_runs(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(IntegrationDetail { integration, sync_runs }))
 }
 
 pub async fn create_integration(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateIntegrationRequest>,
 ) -> ServiceResult<RepositoryIntegration> {
 	if request.external_project.trim().is_empty() {
 		return Err(bad_request("external project is required"));
 	}
 
-	if load_repository_row(&state.db, request.repository_id)
+	let mut tx = open_scope(&state, &claims).await?;
+	if load_repository_row(&mut *tx, request.repository_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.is_none()
@@ -62,10 +71,11 @@ pub async fn create_integration(
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let branch_mapping = serde_json::to_value(&request.branch_mapping).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO code_repository_integrations (id, repository_id, provider, external_namespace, external_project, external_url, sync_mode, ci_trigger_strategy, status, default_branch, branch_mapping, webhook_url, last_synced_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15)",
+		"INSERT INTO code_repository_integrations (id, repository_id, provider, external_namespace, external_project, external_url, sync_mode, ci_trigger_strategy, status, default_branch, branch_mapping, webhook_url, last_synced_at, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16)",
 	)
 	.bind(id)
 	.bind(request.repository_id)
@@ -82,14 +92,16 @@ pub async fn create_integration(
 	.bind(Option::<chrono::DateTime<chrono::Utc>>::None)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_integration_row(&state.db, id)
+	let row = load_integration_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created integration could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let integration = RepositoryIntegration::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(integration))
 }
@@ -97,9 +109,11 @@ pub async fn create_integration(
 pub async fn update_integration(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateIntegrationRequest>,
 ) -> ServiceResult<RepositoryIntegration> {
-	let current = load_integration_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let current = load_integration_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("integration not found"))?;
@@ -133,14 +147,15 @@ pub async fn update_integration(
 	.bind(branch_mapping)
 	.bind(request.webhook_url.unwrap_or(current.webhook_url))
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_integration_row(&state.db, id)
+	let row = load_integration_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated integration could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let integration = RepositoryIntegration::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(integration))
 }
@@ -148,17 +163,22 @@ pub async fn update_integration(
 pub async fn list_sync_runs(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<ExternalSyncRun>> {
-	let items = load_sync_runs(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	let items = load_sync_runs(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items }))
 }
 
 pub async fn trigger_sync(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<TriggerSyncRequest>,
 ) -> ServiceResult<ExternalSyncRun> {
-	let integration_row = load_integration_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let integration_row = load_integration_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("integration not found"))?;
@@ -182,10 +202,11 @@ pub async fn trigger_sync(
 		format!("ci:{}", integration.ci_trigger_strategy),
 		format!("provider:{}", integration.provider.as_str()),
 	]);
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO code_repository_sync_runs (id, integration_id, repository_id, trigger, status, commit_sha, branch_name, summary, checks, started_at, completed_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)",
+		"INSERT INTO code_repository_sync_runs (id, integration_id, repository_id, trigger, status, commit_sha, branch_name, summary, checks, started_at, completed_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)",
 	)
 	.bind(sync_id)
 	.bind(id)
@@ -198,7 +219,8 @@ pub async fn trigger_sync(
 	.bind(checks)
 	.bind(now)
 	.bind(Some(now + Duration::minutes(4)))
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -213,15 +235,16 @@ pub async fn trigger_sync(
 	.bind("connected")
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let sync_run = load_sync_runs(&state.db, id)
+	let sync_run = load_sync_runs(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.into_iter()
 		.find(|run| run.id == sync_id)
 		.ok_or_else(|| internal_error("created sync run could not be reloaded"))?;
+	commit_scope(tx).await?;
 	Ok(Json(sync_run))
 }

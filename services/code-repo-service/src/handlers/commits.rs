@@ -1,9 +1,13 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::ci,
-	handlers::{bad_request, db_error, internal_error, load_ci_runs, load_commits, load_repository_row, not_found, ServiceResult},
+	handlers::{
+		bad_request, commit_scope, db_error, internal_error, load_ci_runs, load_commits, load_repository_row, not_found,
+		open_scope, ServiceResult,
+	},
 	models::{commit::{CiRun, CommitDefinition, CreateCommitRequest, TriggerCiRunRequest}, ListResponse},
 	AppState,
 };
@@ -11,31 +15,37 @@ use crate::{
 pub async fn list_commits(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<CommitDefinition>> {
-	load_repository_row(&state.db, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
-	let commits = load_commits(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	load_repository_row(&mut *tx, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
+	let commits = load_commits(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items: commits }))
 }
 
 pub async fn create_commit(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateCommitRequest>,
 ) -> ServiceResult<CommitDefinition> {
 	if request.title.trim().is_empty() {
 		return Err(bad_request("commit title is required"));
 	}
-	load_repository_row(&state.db, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
-	let commits = load_commits(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	load_repository_row(&mut *tx, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
+	let commits = load_commits(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
 	let parent_sha = commits.iter().find(|commit| commit.branch_name == request.branch_name).map(|commit| commit.sha.clone());
 	let sequence = commits.len() + 1;
 	let sha = format!("{:07x}", (id.as_u128() as usize + sequence) % 0x0fff_fff);
 	let now = Utc::now();
 	let files_changed = crate::domain::git::commit_files_changed(&request.title) as i32;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO code_repository_commits (id, repository_id, branch_name, sha, parent_sha, title, description, author_name, author_email, files_changed, additions, deletions, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+		"INSERT INTO code_repository_commits (id, repository_id, branch_name, sha, parent_sha, title, description, author_name, author_email, files_changed, additions, deletions, created_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 	)
 	.bind(uuid::Uuid::now_v7())
 	.bind(id)
@@ -50,7 +60,8 @@ pub async fn create_commit(
 	.bind(request.additions)
 	.bind(request.deletions)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -61,11 +72,12 @@ pub async fn create_commit(
 	.bind(&sha)
 	.bind(now)
 	.bind(&request.branch_name)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let commits = load_commits(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let commits = load_commits(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	let commit = commits.into_iter().find(|entry| entry.sha == sha).ok_or_else(|| internal_error("created commit could not be reloaded"))?;
 	Ok(Json(commit))
 }
@@ -73,25 +85,31 @@ pub async fn create_commit(
 pub async fn list_ci_runs(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<CiRun>> {
-	load_repository_row(&state.db, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
-	let runs = load_ci_runs(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	load_repository_row(&mut *tx, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
+	let runs = load_ci_runs(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items: runs }))
 }
 
 pub async fn trigger_ci_run(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<TriggerCiRunRequest>,
 ) -> ServiceResult<CiRun> {
-	load_repository_row(&state.db, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
-	let commits = load_commits(&state.db, id).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	load_repository_row(&mut *tx, id).await.map_err(|cause| db_error(&cause))?.ok_or_else(|| not_found("repository not found"))?;
+	let commits = load_commits(&mut *tx, id).await.map_err(|cause| db_error(&cause))?;
 	let run = ci::simulate_ci_run(id, &request.branch_name, commits.iter().find(|commit| commit.branch_name == request.branch_name));
 	let checks = serde_json::to_value(&run.checks).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO code_ci_runs (id, repository_id, branch_name, commit_sha, pipeline_name, status, trigger, started_at, completed_at, checks)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)",
+		"INSERT INTO code_ci_runs (id, repository_id, branch_name, commit_sha, pipeline_name, status, trigger, started_at, completed_at, checks, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)",
 	)
 	.bind(run.id)
 	.bind(run.repository_id)
@@ -103,9 +121,11 @@ pub async fn trigger_ci_run(
 	.bind(run.started_at)
 	.bind(run.completed_at)
 	.bind(checks)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
+	commit_scope(tx).await?;
 	Ok(Json(run))
 }

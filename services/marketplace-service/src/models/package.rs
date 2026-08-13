@@ -94,6 +94,8 @@ pub struct PackageVersionRow {
 	pub dependencies: Value,
 	pub manifest: Value,
 	pub published_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<PackageVersionRow> for PackageVersion {
