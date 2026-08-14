@@ -182,14 +182,19 @@ mod tests {
     #[test]
     fn migration_url_falls_back_to_runtime_url() {
         let previous = std::env::var("MIGRATION_DATABASE_URL").ok();
-        std::env::remove_var("MIGRATION_DATABASE_URL");
+        // SAFETY: this unit test is the only code that mutates the process env here.
+        unsafe {
+            std::env::remove_var("MIGRATION_DATABASE_URL");
+        }
         assert_eq!(
             resolve_migration_database_url("postgres://openfoundry_app@localhost/openfoundry"),
             "postgres://openfoundry_app@localhost/openfoundry"
         );
-        match previous {
-            Some(value) => std::env::set_var("MIGRATION_DATABASE_URL", value),
-            None => std::env::remove_var("MIGRATION_DATABASE_URL"),
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MIGRATION_DATABASE_URL", value),
+                None => std::env::remove_var("MIGRATION_DATABASE_URL"),
+            }
         }
     }
 }
