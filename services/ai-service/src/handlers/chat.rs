@@ -460,7 +460,7 @@ pub async fn get_overview(
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
-	let indexed_chunk_count = query_scalar::<_, i64>("SELECT COALESCE(SUM(chunk_count), 0) FROM ai_knowledge_documents")
+	let indexed_chunk_count = query_scalar::<_, i64>("SELECT COALESCE(SUM(chunk_count), 0)::bigint FROM ai_knowledge_documents")
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
@@ -476,7 +476,7 @@ pub async fn get_overview(
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
-	let total_cache_hits = query_scalar::<_, i64>("SELECT COALESCE(SUM(hit_count), 0) FROM ai_semantic_cache")
+	let total_cache_hits = query_scalar::<_, i64>("SELECT COALESCE(SUM(hit_count), 0)::bigint FROM ai_semantic_cache")
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
