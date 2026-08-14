@@ -8,6 +8,7 @@ use crate::AppState;
 use crate::models::user::User;
 
 use super::common::{build_user_response, json_error, require_permission};
+use super::tenant::begin_scope;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateUserRequest {
@@ -20,8 +21,12 @@ pub struct UpdateUserRequest {
 
 /// GET /api/v1/users/me
 pub async fn me(State(state): State<AppState>, AuthUser(claims): AuthUser) -> impl IntoResponse {
-    match load_user(&state.db, claims.sub).await {
-        Ok(Some(user)) => match build_user_response(&state.db, user).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match load_user(&mut tx, claims.sub).await {
+        Ok(Some(user)) => match build_user_response(&mut tx, user).await {
             Ok(response) => Json(response).into_response(),
             Err(e) => {
                 tracing::error!("failed to build user response: {e}");
@@ -45,17 +50,21 @@ pub async fn list_users(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let users = sqlx::query_as::<_, User>(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT 200",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await;
 
     match users {
         Ok(users) => {
             let mut responses = Vec::with_capacity(users.len());
             for user in users {
-                match build_user_response(&state.db, user).await {
+                match build_user_response(&mut tx, user).await {
                     Ok(response) => responses.push(response),
                     Err(e) => {
                         tracing::error!("failed to build user response: {e}");
@@ -84,7 +93,11 @@ pub async fn update_user(
         return response;
     }
 
-    let Some(existing_user) = (match load_user(&state.db, user_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let Some(existing_user) = (match load_user(&mut tx, user_id).await {
         Ok(user) => user,
         Err(e) => {
             tracing::error!("failed to load user for update: {e}");
@@ -116,12 +129,12 @@ pub async fn update_user(
     .bind(updated_attributes)
     .bind(updated_mfa_enforced)
     .bind(updated_is_active)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
 
     match result {
-        Ok(_) => match load_user(&state.db, user_id).await {
-            Ok(Some(user)) => match build_user_response(&state.db, user).await {
+        Ok(_) => match load_user(&mut tx, user_id).await {
+            Ok(Some(user)) => match build_user_response(&mut tx, user).await {
                 Ok(response) => Json(response).into_response(),
                 Err(e) => {
                     tracing::error!("failed to build updated user response: {e}");
@@ -151,9 +164,13 @@ pub async fn deactivate_user(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query("UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1")
         .bind(user_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
@@ -166,11 +183,11 @@ pub async fn deactivate_user(
     }
 }
 
-async fn load_user(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Option<User>, sqlx::Error> {
+async fn load_user(conn: &mut sqlx::PgConnection, user_id: Uuid) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }

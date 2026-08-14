@@ -38,6 +38,10 @@ pub struct UserResponse {
 }
 
 impl User {
+    pub fn tenant_scope_id(&self) -> Uuid {
+        self.organization_id.unwrap_or(self.id)
+    }
+
     pub fn into_response(self, roles: Vec<String>) -> UserResponse {
         UserResponse {
             id: self.id,

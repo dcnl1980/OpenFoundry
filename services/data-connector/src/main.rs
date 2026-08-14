@@ -10,7 +10,6 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -33,16 +32,19 @@ async fn main() {
 
     let cfg = config::AppConfig::from_env().expect("failed to load config");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&cfg.database_url)
+    let migration_url = auth_middleware::resolve_migration_database_url(&cfg.database_url);
+    let migration_pool = sqlx::PgPool::connect(&migration_url)
         .await
-        .expect("failed to connect to database");
-
+        .expect("failed to connect to migration database");
     sqlx::migrate!("./migrations")
-        .run(&pool)
+        .run(&migration_pool)
         .await
         .expect("failed to run migrations");
+    migration_pool.close().await;
+
+    let pool = auth_middleware::connect_runtime_pool(&cfg.database_url)
+        .await
+        .expect("failed to connect to database");
 
     let jwt_config = JwtConfig::new(&cfg.jwt_secret);
 

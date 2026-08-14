@@ -1,9 +1,11 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::domain::jwt::issue_tokens;
 use crate::domain::mfa;
+use crate::handlers::tenant::begin_tenant_id;
 use crate::models::mfa::TotpConfiguration;
 use crate::models::user::User;
 
@@ -41,11 +43,42 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let user = sqlx::query_as::<_, User>(
-        "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE email = $1",
+    let lookup = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT id, tenant_id FROM openfoundry_lookup_user_by_email($1)",
     )
     .bind(&body.email)
     .fetch_optional(&state.db)
+    .await;
+
+    let (user_id, tenant_id) = match lookup {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "invalid credentials" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to look up user for login: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "login failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut tx = match begin_tenant_id(&state, tenant_id).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+
+    let user = sqlx::query_as::<_, User>(
+        "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
     .await;
 
     let user = match user {
@@ -69,8 +102,14 @@ pub async fn login(
         "SELECT user_id, secret, recovery_code_hashes, enabled, verified_at, created_at, updated_at FROM user_mfa_totp WHERE user_id = $1",
     )
     .bind(user.id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("failed to commit login tenant scope: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "login failed" })))
+            .into_response();
+    }
 
     let mfa_configuration = match mfa_configuration {
         Ok(config) => config,

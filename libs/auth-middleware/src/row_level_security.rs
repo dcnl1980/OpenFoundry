@@ -102,6 +102,44 @@ pub async fn fetch_due_work(
     sqlx::query_as::<_, DueWork>(sql).fetch_all(pool).await
 }
 
+/// True when the connected role would silently skip FORCE ROW LEVEL SECURITY.
+pub fn is_privileged_runtime_role(rolsuper: bool, rolbypassrls: bool) -> bool {
+    rolsuper || rolbypassrls
+}
+
+pub fn privileged_runtime_role_message(role: &str) -> String {
+    format!(
+        "DATABASE_URL must use a non-superuser, non-BYPASSRLS role (got '{role}'). Use openfoundry_app so FORCE ROW LEVEL SECURITY applies."
+    )
+}
+
+pub fn resolve_migration_database_url(runtime_url: &str) -> String {
+    std::env::var("MIGRATION_DATABASE_URL").unwrap_or_else(|_| runtime_url.to_string())
+}
+
+pub async fn reject_privileged_runtime_role(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    let (rolsuper, rolbypassrls, role): (bool, bool, String) = sqlx::query_as(
+        "SELECT rolsuper, rolbypassrls, current_user FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await?;
+    if is_privileged_runtime_role(rolsuper, rolbypassrls) {
+        return Err(sqlx::Error::Configuration(
+            privileged_runtime_role_message(&role).into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn connect_runtime_pool(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .connect(database_url)
+        .await?;
+    reject_privileged_runtime_role(&pool).await?;
+    Ok(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +168,28 @@ mod tests {
         assert_eq!(with_org.tenant_scope_id(), org);
         assert_eq!(personal.tenant_scope_id(), user);
         assert_eq!(with_org.org_filter("tenant_id"), format!("tenant_id = '{org}'"));
+    }
+
+    #[test]
+    fn privileged_runtime_role_detects_superuser_and_bypass() {
+        assert!(is_privileged_runtime_role(true, false));
+        assert!(is_privileged_runtime_role(false, true));
+        assert!(is_privileged_runtime_role(true, true));
+        assert!(!is_privileged_runtime_role(false, false));
+        assert!(privileged_runtime_role_message("openfoundry").contains("openfoundry_app"));
+    }
+
+    #[test]
+    fn migration_url_falls_back_to_runtime_url() {
+        let previous = std::env::var("MIGRATION_DATABASE_URL").ok();
+        std::env::remove_var("MIGRATION_DATABASE_URL");
+        assert_eq!(
+            resolve_migration_database_url("postgres://openfoundry_app@localhost/openfoundry"),
+            "postgres://openfoundry_app@localhost/openfoundry"
+        );
+        match previous {
+            Some(value) => std::env::set_var("MIGRATION_DATABASE_URL", value),
+            None => std::env::remove_var("MIGRATION_DATABASE_URL"),
+        }
     }
 }

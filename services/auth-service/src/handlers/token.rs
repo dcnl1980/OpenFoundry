@@ -4,6 +4,7 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::domain::jwt::{get_refresh_token, issue_tokens, refresh_token_matches, revoke_refresh_token};
 use crate::handlers::login::TokenResponse;
+use crate::handlers::tenant::begin_scope;
 use crate::models::user::User;
 
 #[derive(Debug, Deserialize)]
@@ -15,7 +16,6 @@ pub async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
 ) -> impl IntoResponse {
-    // Decode the refresh token
     let claims = match auth_middleware::jwt::decode_token(&state.jwt_config, &body.refresh_token) {
         Ok(c) if c.token_use.as_deref() == Some("refresh") => c,
         Err(_) => {
@@ -28,7 +28,12 @@ pub async fn refresh(
         }
     };
 
-    let Some(stored_token) = (match get_refresh_token(&state.db, claims.jti).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+
+    let Some(stored_token) = (match get_refresh_token(&mut tx, claims.jti).await {
         Ok(record) => record,
         Err(e) => {
             tracing::error!("failed to load refresh token: {e}");
@@ -45,12 +50,11 @@ pub async fn refresh(
             .into_response();
     }
 
-    // Fetch the user
     let user = sqlx::query_as::<_, User>(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1 AND is_active = true",
     )
     .bind(claims.sub)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
 
     let user = match user {
@@ -61,8 +65,14 @@ pub async fn refresh(
         }
     };
 
-    if let Err(e) = revoke_refresh_token(&state.db, claims.jti).await {
+    if let Err(e) = revoke_refresh_token(&mut tx, claims.jti).await {
         tracing::error!("failed to revoke refresh token: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "token refresh failed" })))
+            .into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("failed to commit refresh tenant scope: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "token refresh failed" })))
             .into_response();
     }

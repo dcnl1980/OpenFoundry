@@ -21,7 +21,7 @@ The `main` branch is the supported line until a numbered release exists.
 - Data plane: `tenant_id` on tenant-owned tables, `SET LOCAL openfoundry.tenant_id`, and PostgreSQL RLS (`FORCE ROW LEVEL SECURITY`).
 - The runtime database role must not be `SUPERUSER` or `BYPASSRLS`. Use `openfoundry_app`.
 - Admins stay inside their tenant. There is no RLS bypass for `role=admin`.
-- Platform-global catalogs (`ai_providers`, `ai_tools`, `app_templates`) are not tenant-partitioned.
+- Platform catalogs (`ai_providers`, `ai_tools`, `app_templates`) and control-plane auth/audit tables are tenant-partitioned with the same RLS boundary.
 - Scheduled pipeline/workflow discovery uses `SECURITY DEFINER` functions, then a tenant transaction per row.
 
 ## Secrets

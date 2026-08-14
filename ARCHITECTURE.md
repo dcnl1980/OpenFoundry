@@ -60,9 +60,11 @@ JWT → Claims::tenant_scope_id()
 
 The application database role must **not** be `SUPERUSER` or `BYPASSRLS`. Superusers silently skip RLS even when `FORCE ROW LEVEL SECURITY` is on. Cross-tenant reads, writes, search, and guessed UUIDs must be indistinguishable 404/empty results.
 
-This data-plane boundary is enforced on tenant-owned tables in ontology, query, dataset, pipeline, workflow, notebook, ML, fusion, streaming, geospatial, app-builder, AI (conversations, knowledge, agents, prompts, cache), data-connector, report, marketplace, code-repo, nexus, and notification.
+This data-plane boundary is enforced on tenant-owned tables in ontology, query, dataset, pipeline, workflow, notebook, ML, fusion, streaming, geospatial, app-builder (including `app_templates`), AI (providers, tools, conversations, knowledge, agents, prompts, cache), data-connector, report, marketplace, code-repo, nexus, notification, auth, and audit.
 
-Platform-global catalogs stay unscoped: `ai_providers`, `ai_tools`, and `app_templates`. Auth and audit remain control-plane services.
+Auth login/register/SSO public entry points look up a user or provider through `SECURITY DEFINER` helpers, then reopen a tenant transaction. Email and SSO slugs stay globally unique so those lookups stay unambiguous. System roles (`admin`, `editor`, `viewer`) remain readable inside every tenant.
+
+Services migrate with `MIGRATION_DATABASE_URL` (owner/superuser) and serve traffic through `DATABASE_URL` as `openfoundry_app`. `connect_runtime_pool` refuses `SUPERUSER` and `BYPASSRLS` roles because those skip `FORCE ROW LEVEL SECURITY`.
 
 Scheduled pipeline and workflow workers discover due rows through `SECURITY DEFINER` functions (`openfoundry_due_pipelines`, `openfoundry_due_workflows`), then reopen a normal tenant transaction per row. The runtime role must still be `openfoundry_app` (`NOSUPERUSER NOBYPASSRLS`); the owner/superuser role bypasses RLS.
 

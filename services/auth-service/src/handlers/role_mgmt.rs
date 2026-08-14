@@ -10,6 +10,7 @@ use crate::models::permission::Permission;
 use crate::models::role::Role;
 
 use super::common::{json_error, require_permission};
+use super::tenant::begin_scope;
 
 #[derive(Debug, Serialize)]
 pub struct RoleResponse {
@@ -50,15 +51,19 @@ pub async fn list_roles(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let roles = sqlx::query_as::<_, Role>("SELECT id, name, description, created_at FROM roles ORDER BY name")
-        .fetch_all(&state.db)
+        .fetch_all(&mut *tx)
         .await;
 
     match roles {
         Ok(roles) => {
             let mut responses = Vec::with_capacity(roles.len());
             for role in roles {
-                match build_role_response(&state.db, role).await {
+                match build_role_response(&mut tx, role).await {
                     Ok(response) => responses.push(response),
                     Err(e) => {
                         tracing::error!("failed to build role response: {e}");
@@ -86,19 +91,24 @@ pub async fn create_role(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let role_id = Uuid::now_v7();
     let result = sqlx::query(
-        "INSERT INTO roles (id, name, description) VALUES ($1, $2, $3)",
+        "INSERT INTO roles (id, name, description, tenant_id) VALUES ($1, $2, $3, $4)",
     )
     .bind(role_id)
     .bind(&body.name)
     .bind(&body.description)
-    .execute(&state.db)
+    .bind(claims.tenant_scope_id())
+    .execute(&mut *tx)
     .await;
 
     match result {
         Ok(_) => {
-            if let Err(e) = replace_role_permissions(&state.db, role_id, &body.permission_ids).await {
+            if let Err(e) = replace_role_permissions(&mut tx, role_id, &body.permission_ids).await {
                 tracing::error!("failed to assign role permissions: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -107,10 +117,10 @@ pub async fn create_role(
                 "SELECT id, name, description, created_at FROM roles WHERE id = $1",
             )
             .bind(role_id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await
             {
-                Ok(role) => match build_role_response(&state.db, role).await {
+                Ok(role) => match build_role_response(&mut tx, role).await {
                     Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
                     Err(e) => {
                         tracing::error!("failed to build created role response: {e}");
@@ -141,18 +151,22 @@ pub async fn update_role(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query(
         "UPDATE roles SET description = $2 WHERE id = $1",
     )
     .bind(role_id)
     .bind(body.description)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
 
     match result {
         Ok(record) if record.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
-            if let Err(e) = replace_role_permissions(&state.db, role_id, &body.permission_ids).await {
+            if let Err(e) = replace_role_permissions(&mut tx, role_id, &body.permission_ids).await {
                 tracing::error!("failed to replace role permissions: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -161,10 +175,10 @@ pub async fn update_role(
                 "SELECT id, name, description, created_at FROM roles WHERE id = $1",
             )
             .bind(role_id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await
             {
-                Ok(role) => match build_role_response(&state.db, role).await {
+                Ok(role) => match build_role_response(&mut tx, role).await {
                     Ok(response) => Json(response).into_response(),
                     Err(e) => {
                         tracing::error!("failed to build updated role response: {e}");
@@ -195,7 +209,11 @@ pub async fn assign_role(
         return response;
     }
 
-    match rbac::assign_role(&state.db, user_id, body.role_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match rbac::assign_role(&mut tx, user_id, body.role_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!("role assignment failed: {e}");
@@ -214,7 +232,11 @@ pub async fn remove_role(
         return response;
     }
 
-    match rbac::remove_role(&state.db, user_id, role_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match rbac::remove_role(&mut tx, user_id, role_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!("role removal failed: {e}");
@@ -223,7 +245,10 @@ pub async fn remove_role(
     }
 }
 
-async fn build_role_response(pool: &sqlx::PgPool, role: Role) -> Result<RoleResponse, sqlx::Error> {
+async fn build_role_response(
+    conn: &mut sqlx::PgConnection,
+    role: Role,
+) -> Result<RoleResponse, sqlx::Error> {
     let permissions = sqlx::query_as::<_, Permission>(
         r#"SELECT p.id, p.resource, p.action, p.description, p.created_at
            FROM permissions p
@@ -232,7 +257,7 @@ async fn build_role_response(pool: &sqlx::PgPool, role: Role) -> Result<RoleResp
            ORDER BY p.resource, p.action"#,
     )
     .bind(role.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     Ok(RoleResponse {
@@ -249,23 +274,22 @@ async fn build_role_response(pool: &sqlx::PgPool, role: Role) -> Result<RoleResp
 }
 
 async fn replace_role_permissions(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     role_id: Uuid,
     permission_ids: &[Uuid],
 ) -> Result<(), sqlx::Error> {
-    let mut transaction = pool.begin().await?;
     sqlx::query("DELETE FROM role_permissions WHERE role_id = $1")
         .bind(role_id)
-        .execute(&mut *transaction)
+        .execute(&mut *conn)
         .await?;
 
     for permission_id in permission_ids {
         sqlx::query("INSERT INTO role_permissions (role_id, permission_id) VALUES ($1, $2)")
             .bind(role_id)
             .bind(permission_id)
-            .execute(&mut *transaction)
+            .execute(&mut *conn)
             .await?;
     }
 
-    transaction.commit().await
+    Ok(())
 }

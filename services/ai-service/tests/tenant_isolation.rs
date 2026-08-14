@@ -137,3 +137,56 @@ async fn tenant_b_cannot_see_tenant_a_conversation_knowledge_or_agent() {
     assert_eq!(knowledge_base, None);
     assert_eq!(agent, None);
 }
+
+#[tokio::test]
+async fn tenant_b_cannot_see_tenant_a_provider_or_tool() {
+    let pool = pool().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let provider_id = Uuid::now_v7();
+    let tool_id = Uuid::now_v7();
+
+    let mut tx_a = begin_tenant_transaction(&pool, tenant_a).await.expect("a");
+    sqlx::query(
+        r#"INSERT INTO ai_providers (
+               id, name, provider_type, model_name, endpoint_url, tenant_id
+           ) VALUES ($1, $2, 'openai', 'gpt-test', 'https://example.test', $3)"#,
+    )
+    .bind(provider_id)
+    .bind(format!("provider-{}", provider_id))
+    .bind(tenant_a)
+    .execute(&mut *tx_a)
+    .await
+    .expect("insert provider");
+    sqlx::query(
+        r#"INSERT INTO ai_tools (id, name, tenant_id) VALUES ($1, $2, $3)"#,
+    )
+    .bind(tool_id)
+    .bind(format!("tool-{}", tool_id))
+    .bind(tenant_a)
+    .execute(&mut *tx_a)
+    .await
+    .expect("insert tool");
+    tx_a.commit().await.expect("commit");
+
+    let mut tx_b = begin_tenant_transaction(&pool, tenant_b).await.expect("b");
+    let provider: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ai_providers WHERE id = $1")
+        .bind(provider_id)
+        .fetch_optional(&mut *tx_b)
+        .await
+        .expect("select provider");
+    let tool: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ai_tools WHERE id = $1")
+        .bind(tool_id)
+        .fetch_optional(&mut *tx_b)
+        .await
+        .expect("select tool");
+    let deleted = sqlx::query("DELETE FROM ai_providers WHERE id = $1")
+        .bind(provider_id)
+        .execute(&mut *tx_b)
+        .await
+        .expect("delete")
+        .rows_affected();
+    assert_eq!(provider, None);
+    assert_eq!(tool, None);
+    assert_eq!(deleted, 0);
+}

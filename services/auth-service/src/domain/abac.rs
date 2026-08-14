@@ -1,7 +1,6 @@
 use auth_middleware::Claims;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::policy::Policy;
@@ -14,18 +13,18 @@ pub struct EvaluationResult {
 	pub row_filter: Option<String>,
 }
 
-pub async fn list_policies(pool: &PgPool) -> Result<Vec<Policy>, sqlx::Error> {
+pub async fn list_policies(conn: &mut sqlx::PgConnection) -> Result<Vec<Policy>, sqlx::Error> {
 	sqlx::query_as::<_, Policy>(
 		r#"SELECT id, name, description, effect, resource, action, conditions, row_filter, enabled, created_by, created_at, updated_at
 		   FROM abac_policies
 		   ORDER BY created_at DESC"#,
 	)
-	.fetch_all(pool)
+	.fetch_all(&mut *conn)
 	.await
 }
 
 pub async fn evaluate(
-	pool: &PgPool,
+	conn: &mut sqlx::PgConnection,
 	claims: &Claims,
 	resource: &str,
 	action: &str,
@@ -41,7 +40,7 @@ pub async fn evaluate(
 	)
 	.bind(resource)
 	.bind(action)
-	.fetch_all(pool)
+	.fetch_all(&mut *conn)
 	.await?;
 
 	let subject_context = build_subject_context(claims);

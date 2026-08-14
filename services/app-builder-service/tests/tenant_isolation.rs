@@ -122,3 +122,50 @@ async fn tenant_b_cannot_see_tenant_a_app_and_both_can_use_home_slug() {
     assert_eq!(deleted, 0);
     assert_eq!(own, Some(app_b));
 }
+
+#[tokio::test]
+async fn tenant_b_cannot_see_tenant_a_app_template() {
+    let pool = pool().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let template_id = Uuid::now_v7();
+    let key = format!("ops-{}", template_id);
+
+    let mut tx_a = begin_tenant_transaction(&pool, tenant_a).await.expect("a");
+    sqlx::query(
+        r#"INSERT INTO app_templates (id, key, name, definition, tenant_id)
+           VALUES ($1, $2, 'Ops', '{}'::jsonb, $3)"#,
+    )
+    .bind(template_id)
+    .bind(&key)
+    .bind(tenant_a)
+    .execute(&mut *tx_a)
+    .await
+    .expect("insert template");
+    tx_a.commit().await.expect("commit");
+
+    let mut tx_b = begin_tenant_transaction(&pool, tenant_b).await.expect("b");
+    sqlx::query(
+        r#"INSERT INTO app_templates (id, key, name, definition, tenant_id)
+           VALUES ($1, $2, 'Ops', '{}'::jsonb, $3)"#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(&key)
+    .bind(tenant_b)
+    .execute(&mut *tx_b)
+    .await
+    .expect("insert same key for tenant b");
+    let visible: Option<Uuid> = sqlx::query_scalar("SELECT id FROM app_templates WHERE id = $1")
+        .bind(template_id)
+        .fetch_optional(&mut *tx_b)
+        .await
+        .expect("select");
+    let deleted = sqlx::query("DELETE FROM app_templates WHERE id = $1")
+        .bind(template_id)
+        .execute(&mut *tx_b)
+        .await
+        .expect("delete")
+        .rows_affected();
+    assert_eq!(visible, None);
+    assert_eq!(deleted, 0);
+}

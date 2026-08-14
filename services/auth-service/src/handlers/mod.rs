@@ -8,5 +8,6 @@ pub mod policy_mgmt;
 pub mod register;
 pub mod role_mgmt;
 pub mod sso;
+pub mod tenant;
 pub mod token;
 pub mod user_mgmt;

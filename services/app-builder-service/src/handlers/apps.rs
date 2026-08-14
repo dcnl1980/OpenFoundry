@@ -71,15 +71,18 @@ pub async fn list_apps(
 
 pub async fn list_templates(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<Json<ListAppTemplatesResponse>> {
+	let mut tx = scoped_tx(&state, &claims).await?;
 	let rows = sqlx::query_as::<_, AppTemplateRow>(
 		"SELECT id, key, name, description, category, preview_image_url, definition, created_at
 		 FROM app_templates
 		 ORDER BY category, name",
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(db_error)?;
+	tx.commit().await.map_err(db_error)?;
 
 	Ok(Json(ListAppTemplatesResponse {
 		data: rows.into_iter().map(Into::into).collect(),
@@ -92,7 +95,7 @@ pub async fn create_app(
 	Json(request): Json<CreateAppRequest>,
 ) -> ServiceResult<Json<App>> {
 	let mut tx = scoped_tx(&state, &claims).await?;
-	let app = create_app_impl(&state, &mut tx, request, false, claims.tenant_scope_id()).await?;
+	let app = create_app_impl(&mut tx, request, false, claims.tenant_scope_id()).await?;
 	tx.commit().await.map_err(db_error)?;
 	Ok(Json(app))
 }
@@ -103,7 +106,7 @@ pub async fn create_from_template(
 	Json(request): Json<CreateAppRequest>,
 ) -> ServiceResult<Json<App>> {
 	let mut tx = scoped_tx(&state, &claims).await?;
-	let app = create_app_impl(&state, &mut tx, request, true, claims.tenant_scope_id()).await?;
+	let app = create_app_impl(&mut tx, request, true, claims.tenant_scope_id()).await?;
 	tx.commit().await.map_err(db_error)?;
 	Ok(Json(app))
 }
@@ -164,7 +167,7 @@ pub async fn update_app(
 		if template_key.trim().is_empty() {
 			app.template_key = None;
 		} else {
-			load_template_by_key(&state, &template_key).await?;
+			load_template_by_key(&mut tx, &template_key).await?;
 			app.template_key = Some(template_key);
 		}
 	}
@@ -197,7 +200,6 @@ pub async fn delete_app(
 }
 
 async fn create_app_impl(
-	state: &AppState,
 	tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 	request: CreateAppRequest,
 	require_template: bool,
@@ -220,7 +222,7 @@ async fn create_app_impl(
 	}
 
 	let template = match template_key.as_deref() {
-		Some(key) => Some(load_template_by_key(state, key).await?),
+		Some(key) => Some(load_template_by_key(tx, key).await?),
 		None if require_template => return Err(bad_request("template_key is required")),
 		None => None,
 	};

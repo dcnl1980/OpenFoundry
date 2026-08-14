@@ -51,7 +51,10 @@ async fn load_agent_row(
 	.await
 }
 
-async fn load_tools(db: &sqlx::PgPool, tool_ids: &[Uuid]) -> Result<Vec<ToolDefinition>, sqlx::Error> {
+async fn load_tools(
+	db: &mut sqlx::PgConnection,
+	tool_ids: &[Uuid],
+) -> Result<Vec<ToolDefinition>, sqlx::Error> {
 	let mut tools = Vec::new();
 	for tool_id in tool_ids {
 		if let Some(row) = query_as::<_, ToolRow>(
@@ -73,7 +76,7 @@ async fn load_tools(db: &sqlx::PgPool, tool_ids: &[Uuid]) -> Result<Vec<ToolDefi
 			"#,
 		)
 		.bind(*tool_id)
-		.fetch_optional(db)
+		.fetch_optional(&mut *db)
 		.await?
 		{
 			tools.push(row.into());
@@ -310,7 +313,7 @@ pub async fn execute_agent(
 	};
 
 	let agent: AgentDefinition = current.into();
-	let tools = load_tools(&state.db, &agent.tool_ids)
+	let tools = load_tools(&mut tx, &agent.tool_ids)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 

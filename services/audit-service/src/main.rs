@@ -12,7 +12,6 @@ use axum::{
 };
 use futures::StreamExt;
 use models::audit_event::AppendAuditEventRequest;
-use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -39,16 +38,19 @@ async fn main() {
         tracing::info!(nats_url, "audit collector bus configured");
     }
 
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&cfg.database_url)
+    let migration_url = auth_middleware::resolve_migration_database_url(&cfg.database_url);
+    let migration_pool = sqlx::PgPool::connect(&migration_url)
         .await
-        .expect("failed to connect to database");
-
+        .expect("failed to connect to migration database");
     sqlx::migrate!("./migrations")
-        .run(&pool)
+        .run(&migration_pool)
         .await
         .expect("failed to run migrations");
+    migration_pool.close().await;
+
+    let pool = auth_middleware::connect_runtime_pool(&cfg.database_url)
+        .await
+        .expect("failed to connect to database");
 
     let jwt_config = JwtConfig::new(&cfg.jwt_secret);
     let state = AppState {
@@ -140,8 +142,15 @@ async fn run_nats_collector(db: sqlx::PgPool, nats_url: String) {
                             let parsed = serde_json::from_slice::<event_bus::Event<AppendAuditEventRequest>>(&message.payload);
                             match parsed {
                                 Ok(mut envelope) => {
-                                    if let Err(cause) = handlers::events::persist_event(&db, &mut envelope.payload).await {
-                                        tracing::warn!(?cause, event_type = envelope.event_type, "failed to persist collected audit event");
+                                    match handlers::events::tenant_id_from_collected_event(&envelope.payload) {
+                                        Some(tenant_id) => {
+                                            if let Err(cause) = handlers::events::persist_event(&db, tenant_id, &mut envelope.payload).await {
+                                                tracing::warn!(?cause, event_type = envelope.event_type, "failed to persist collected audit event");
+                                            }
+                                        }
+                                        None => {
+                                            tracing::warn!(event_type = envelope.event_type, "skipping collected audit event without tenant_id");
+                                        }
                                     }
                                 }
                                 Err(cause) => {

@@ -1,8 +1,9 @@
+use auth_middleware::layer::AuthUser;
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
 
 use crate::{
-	handlers::{bad_request, db_error, internal_error, load_policies, load_policy_row, ServiceResult},
+	handlers::{bad_request, db_error, internal_error, load_policies, load_policy_row, tenant::begin_scope, ServiceResult},
 	models::{
 		data_classification::{ClassificationCatalogEntry, ClassificationLevel},
 		policy::{AuditPolicy, CreatePolicyRequest, UpdatePolicyRequest},
@@ -19,13 +20,18 @@ pub async fn list_classifications() -> ServiceResult<Vec<ClassificationCatalogEn
 	]))
 }
 
-pub async fn list_policies(State(state): State<AppState>) -> ServiceResult<ListResponse<AuditPolicy>> {
-	let policies = load_policies(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_policies(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<AuditPolicy>> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let policies = load_policies(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(ListResponse { items: policies }))
 }
 
 pub async fn create_policy(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreatePolicyRequest>,
 ) -> ServiceResult<AuditPolicy> {
 	if request.name.trim().is_empty() {
@@ -34,10 +40,11 @@ pub async fn create_policy(
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let rules = serde_json::to_value(&request.rules).map_err(|cause| internal_error(cause.to_string()))?;
+	let mut tx = begin_scope(&state, &claims).await?;
 
 	sqlx::query(
-		"INSERT INTO audit_policies (id, name, description, scope, classification, retention_days, legal_hold, purge_mode, active, rules, updated_by, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13)",
+		"INSERT INTO audit_policies (id, name, description, scope, classification, retention_days, legal_hold, purge_mode, active, rules, updated_by, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)",
 	)
 	.bind(id)
 	.bind(&request.name)
@@ -52,11 +59,12 @@ pub async fn create_policy(
 	.bind(&request.updated_by)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(claims.tenant_scope_id())
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_policy_row(&state.db, id)
+	let row = load_policy_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created policy could not be reloaded"))?;
@@ -67,9 +75,11 @@ pub async fn create_policy(
 pub async fn update_policy(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdatePolicyRequest>,
 ) -> ServiceResult<AuditPolicy> {
-	let row = load_policy_row(&state.db, id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let row = load_policy_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| crate::handlers::not_found("policy not found"))?;
@@ -106,11 +116,11 @@ pub async fn update_policy(
 	.bind(rules)
 	.bind(&policy.updated_by)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_policy_row(&state.db, id)
+	let row = load_policy_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated policy could not be reloaded"))?;

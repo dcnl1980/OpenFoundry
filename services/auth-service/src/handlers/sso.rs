@@ -2,6 +2,7 @@ use axum::{Json, extract::{Path, State}, http::StatusCode, response::IntoRespons
 use auth_middleware::layer::AuthUser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -12,6 +13,7 @@ use crate::models::user::User;
 
 use super::common::{json_error, require_permission};
 use super::login::LoginResponse;
+use super::tenant::{begin_scope, begin_tenant_id};
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertProviderRequest {
@@ -50,15 +52,20 @@ pub struct PublicProviderResponse {
 }
 
 pub async fn list_public_providers(State(state): State<AppState>) -> impl IntoResponse {
-    match list_enabled_oidc_providers(&state.db).await {
+    match sqlx::query_as::<_, (Uuid, String, String, String)>(
+        "SELECT id, slug, name, provider_type FROM openfoundry_list_public_sso_providers()",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
         Ok(providers) => Json(
             providers
                 .into_iter()
-                .map(|provider| PublicProviderResponse {
-                    id: provider.id,
-                    slug: provider.slug,
-                    name: provider.name,
-                    provider_type: provider.provider_type,
+                .map(|(id, slug, name, provider_type)| PublicProviderResponse {
+                    id,
+                    slug,
+                    name,
+                    provider_type,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -74,7 +81,25 @@ pub async fn start_login(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    let provider = match load_provider_by_slug(&state.db, &slug).await {
+    let lookup = match sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT id, tenant_id FROM openfoundry_lookup_sso_provider_by_slug($1)",
+    )
+    .bind(&slug)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("failed to look up SSO provider: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut tx = match begin_tenant_id(&state, lookup.1).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let provider = match load_provider_by_id(&mut tx, lookup.0).await {
         Ok(Some(provider)) => provider,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -103,7 +128,25 @@ pub async fn complete_login(
         Err(error) => return json_error(StatusCode::UNAUTHORIZED, error),
     };
 
-    let provider = match load_provider_by_id(&state.db, state_claims.sub).await {
+    let lookup = match sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT id, tenant_id FROM openfoundry_lookup_sso_provider_by_id($1)",
+    )
+    .bind(state_claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("failed to look up SSO provider by state: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut tx = match begin_tenant_id(&state, lookup.1).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let provider = match load_provider_by_id(&mut tx, lookup.0).await {
         Ok(Some(provider)) => provider,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -137,7 +180,7 @@ pub async fn complete_login(
         Err(error) => return json_error(StatusCode::BAD_GATEWAY, error),
     };
 
-    let user = match find_or_create_sso_user(&state.db, &provider, &subject, &email, &name, &userinfo).await {
+    let user = match find_or_create_sso_user(&mut tx, lookup.1, &provider, &subject, &email, &name, &userinfo).await {
         Ok(user) => user,
         Err(e) => {
             tracing::error!("failed to materialize SSO user: {e}");
@@ -145,7 +188,7 @@ pub async fn complete_login(
         }
     };
 
-    let mfa_configuration = match load_mfa_configuration(&state.db, user.id).await {
+    let mfa_configuration = match load_mfa_configuration(&mut tx, user.id).await {
         Ok(configuration) => configuration,
         Err(e) => {
             tracing::error!("failed to load MFA after SSO: {e}");
@@ -172,6 +215,11 @@ pub async fn complete_login(
         return json_error(StatusCode::FORBIDDEN, "mfa setup required by administrator");
     }
 
+    if let Err(e) = tx.commit().await {
+        tracing::error!("failed to commit SSO login tenant scope: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     match jwt::issue_tokens(&state.db, &state.jwt_config, &user, vec!["sso".to_string()]).await {
         Ok((platform_access_token, refresh_token)) => Json(LoginResponse::Authenticated {
             access_token: platform_access_token,
@@ -195,10 +243,14 @@ pub async fn list_providers(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, SsoProvider>(
         "SELECT id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, created_at, updated_at FROM sso_providers ORDER BY name",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     {
         Ok(providers) => Json(providers.into_iter().map(SsoProvider::into_response).collect::<Vec<SsoProviderResponse>>()).into_response(),
@@ -218,9 +270,13 @@ pub async fn create_provider(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, SsoProvider>(
-        r#"INSERT INTO sso_providers (id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        r#"INSERT INTO sso_providers (id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
            RETURNING id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, created_at, updated_at"#,
     )
     .bind(Uuid::now_v7())
@@ -240,7 +296,8 @@ pub async fn create_provider(
     .bind(body.saml_sso_url)
     .bind(body.saml_certificate)
     .bind(body.attribute_mapping)
-    .fetch_one(&state.db)
+    .bind(claims.tenant_scope_id())
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(provider) => (StatusCode::CREATED, Json(provider.into_response())).into_response(),
@@ -261,7 +318,11 @@ pub async fn update_provider(
         return response;
     }
 
-    let existing = match load_provider_by_id(&state.db, provider_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let existing = match load_provider_by_id(&mut tx, provider_id).await {
         Ok(Some(provider)) => provider,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -309,7 +370,7 @@ pub async fn update_provider(
     .bind(body.saml_sso_url)
     .bind(body.saml_certificate)
     .bind(body.attribute_mapping)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(provider)) => Json(provider.into_response()).into_response(),
@@ -330,9 +391,13 @@ pub async fn delete_provider(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM sso_providers WHERE id = $1")
         .bind(provider_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
         Ok(record) if record.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
@@ -344,43 +409,27 @@ pub async fn delete_provider(
     }
 }
 
-async fn list_enabled_oidc_providers(pool: &sqlx::PgPool) -> Result<Vec<SsoProvider>, sqlx::Error> {
-    sqlx::query_as::<_, SsoProvider>(
-        "SELECT id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, created_at, updated_at FROM sso_providers WHERE enabled = true AND provider_type = 'oidc' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await
-}
-
-async fn load_provider_by_slug(pool: &sqlx::PgPool, slug: &str) -> Result<Option<SsoProvider>, sqlx::Error> {
-    sqlx::query_as::<_, SsoProvider>(
-        "SELECT id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, created_at, updated_at FROM sso_providers WHERE slug = $1 AND enabled = true",
-    )
-    .bind(slug)
-    .fetch_optional(pool)
-    .await
-}
-
-async fn load_provider_by_id(pool: &sqlx::PgPool, provider_id: Uuid) -> Result<Option<SsoProvider>, sqlx::Error> {
+async fn load_provider_by_id(conn: &mut PgConnection, provider_id: Uuid) -> Result<Option<SsoProvider>, sqlx::Error> {
     sqlx::query_as::<_, SsoProvider>(
         "SELECT id, slug, name, provider_type, enabled, client_id, client_secret, issuer_url, authorization_url, token_url, userinfo_url, scopes, saml_metadata_url, saml_entity_id, saml_sso_url, saml_certificate, attribute_mapping, created_at, updated_at FROM sso_providers WHERE id = $1",
     )
     .bind(provider_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }
 
-async fn load_mfa_configuration(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Option<TotpConfiguration>, sqlx::Error> {
+async fn load_mfa_configuration(conn: &mut PgConnection, user_id: Uuid) -> Result<Option<TotpConfiguration>, sqlx::Error> {
     sqlx::query_as::<_, TotpConfiguration>(
         "SELECT user_id, secret, recovery_code_hashes, enabled, verified_at, created_at, updated_at FROM user_mfa_totp WHERE user_id = $1",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }
 
 async fn find_or_create_sso_user(
-    pool: &sqlx::PgPool,
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
     provider: &SsoProvider,
     subject: &str,
     email: &str,
@@ -395,7 +444,7 @@ async fn find_or_create_sso_user(
     )
     .bind(provider.id)
     .bind(subject)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?
     {
         return Ok(user);
@@ -405,37 +454,38 @@ async fn find_or_create_sso_user(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE email = $1",
     )
     .bind(email)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?
     {
         existing_user
     } else {
         let user_id = Uuid::now_v7();
         sqlx::query(
-            r#"INSERT INTO users (id, email, name, password_hash, is_active, auth_source)
-               VALUES ($1, $2, $3, '!sso', true, 'sso')"#,
+            r#"INSERT INTO users (id, email, name, password_hash, is_active, auth_source, organization_id, tenant_id)
+               VALUES ($1, $2, $3, '!sso', true, 'sso', $4, $4)"#,
         )
         .bind(user_id)
         .bind(email)
         .bind(name)
-        .execute(pool)
+        .bind(tenant_id)
+        .execute(&mut *conn)
         .await?;
 
-        if let Some(viewer_role) = rbac::get_role_by_name(pool, "viewer").await? {
-            let _ = rbac::assign_role(pool, user_id, viewer_role.id).await;
+        if let Some(viewer_role) = rbac::get_role_by_name(&mut *conn, "viewer").await? {
+            let _ = rbac::assign_role(&mut *conn, user_id, viewer_role.id).await;
         }
 
         sqlx::query_as::<_, User>(
             "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",
         )
         .bind(user_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?
     };
 
     sqlx::query(
-        r#"INSERT INTO external_identities (provider_id, subject, user_id, email, raw_claims)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO external_identities (provider_id, subject, user_id, email, raw_claims, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (provider_id, subject) DO UPDATE
            SET user_id = EXCLUDED.user_id,
                email = EXCLUDED.email,
@@ -446,7 +496,8 @@ async fn find_or_create_sso_user(
     .bind(user.id)
     .bind(email)
     .bind(raw_claims)
-    .execute(pool)
+    .bind(tenant_id)
+    .execute(&mut *conn)
     .await?;
 
     Ok(user)

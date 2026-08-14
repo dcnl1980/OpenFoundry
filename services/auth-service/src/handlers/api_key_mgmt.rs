@@ -9,6 +9,7 @@ use crate::domain::api_keys::{self, ApiKeyError};
 use crate::models::user::User;
 
 use super::common::json_error;
+use super::tenant::begin_scope;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
@@ -26,7 +27,11 @@ pub async fn list_api_keys(
         return json_error(StatusCode::FORBIDDEN, "missing permission api_keys:self");
     }
 
-    match api_keys::list_api_keys(&state.db, claims.sub).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match api_keys::list_api_keys(&mut tx, claims.sub).await {
         Ok(api_keys) => Json(api_keys).into_response(),
         Err(e) => {
             tracing::error!("failed to list API keys: {e}");
@@ -50,11 +55,15 @@ pub async fn create_api_key(
         return json_error(StatusCode::FORBIDDEN, "requested scopes exceed caller permissions");
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let user = match sqlx::query_as::<_, User>(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",
     )
     .bind(claims.sub)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(user) => user,
@@ -64,7 +73,7 @@ pub async fn create_api_key(
         }
     };
 
-    match api_keys::create_api_key(&state.db, &state.jwt_config, &user, &body.name, body.scopes, body.expires_at).await {
+    match api_keys::create_api_key(&mut tx, &state.jwt_config, &user, &body.name, body.scopes, body.expires_at).await {
         Ok(api_key) => (StatusCode::CREATED, Json(api_key)).into_response(),
         Err(ApiKeyError::InvalidExpiration) => json_error(StatusCode::BAD_REQUEST, "expires_at must be in the future"),
         Err(ApiKeyError::Database(error)) => {
@@ -87,7 +96,11 @@ pub async fn revoke_api_key(
         return json_error(StatusCode::FORBIDDEN, "missing permission api_keys:self");
     }
 
-    match api_keys::revoke_api_key(&state.db, api_key_id, claims.sub).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match api_keys::revoke_api_key(&mut tx, api_key_id, claims.sub).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {

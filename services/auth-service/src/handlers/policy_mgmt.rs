@@ -9,6 +9,7 @@ use crate::domain::abac;
 use crate::models::policy::Policy;
 
 use super::common::{json_error, require_permission};
+use super::tenant::begin_scope;
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertPolicyRequest {
@@ -39,7 +40,11 @@ pub async fn list_policies(
         return response;
     }
 
-    match abac::list_policies(&state.db).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match abac::list_policies(&mut tx).await {
         Ok(policies) => Json(policies).into_response(),
         Err(e) => {
             tracing::error!("failed to list policies: {e}");
@@ -57,9 +62,13 @@ pub async fn create_policy(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Policy>(
-        r#"INSERT INTO abac_policies (id, name, description, effect, resource, action, conditions, row_filter, enabled, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        r#"INSERT INTO abac_policies (id, name, description, effect, resource, action, conditions, row_filter, enabled, created_by, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING id, name, description, effect, resource, action, conditions, row_filter, enabled, created_by, created_at, updated_at"#,
     )
     .bind(Uuid::now_v7())
@@ -72,7 +81,8 @@ pub async fn create_policy(
     .bind(body.row_filter)
     .bind(body.enabled)
     .bind(claims.sub)
-    .fetch_one(&state.db)
+    .bind(claims.tenant_scope_id())
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(policy) => (StatusCode::CREATED, Json(policy)).into_response(),
@@ -93,6 +103,10 @@ pub async fn update_policy(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Policy>(
         r#"UPDATE abac_policies
            SET name = $2,
@@ -116,7 +130,7 @@ pub async fn update_policy(
     .bind(body.conditions)
     .bind(body.row_filter)
     .bind(body.enabled)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(policy)) => Json(policy).into_response(),
@@ -137,9 +151,13 @@ pub async fn delete_policy(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM abac_policies WHERE id = $1")
         .bind(policy_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
         Ok(record) if record.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
@@ -160,7 +178,11 @@ pub async fn evaluate_policy(
         return response;
     }
 
-    match abac::evaluate(&state.db, &claims, &body.resource, &body.action, &body.resource_attributes).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match abac::evaluate(&mut tx, &claims, &body.resource, &body.action, &body.resource_attributes).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
             tracing::error!("failed to evaluate ABAC policies: {e}");

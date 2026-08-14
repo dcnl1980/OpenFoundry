@@ -150,14 +150,17 @@ pub async fn load_app(
 	row.map(Into::into).ok_or_else(|| not_found("app"))
 }
 
-pub async fn load_template_by_key(state: &AppState, key: &str) -> ServiceResult<AppTemplate> {
+pub async fn load_template_by_key(
+	tx: &mut Transaction<'_, Postgres>,
+	key: &str,
+) -> ServiceResult<AppTemplate> {
 	let row = sqlx::query_as::<_, AppTemplateRow>(
 		"SELECT id, key, name, description, category, preview_image_url, definition, created_at
 		 FROM app_templates
 		 WHERE key = $1",
 	)
 	.bind(key)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await
 	.map_err(db_error)?;
 

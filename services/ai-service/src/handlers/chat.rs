@@ -60,7 +60,7 @@ struct CacheRow {
 }
 
 async fn load_provider_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	provider_id: Uuid,
 ) -> Result<Option<ProviderRow>, sqlx::Error> {
 	query_as::<_, ProviderRow>(
@@ -87,11 +87,11 @@ async fn load_provider_row(
 		"#,
 	)
 	.bind(provider_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
-async fn load_provider_rows(db: &sqlx::PgPool) -> Result<Vec<ProviderRow>, sqlx::Error> {
+async fn load_provider_rows(db: &mut sqlx::PgConnection) -> Result<Vec<ProviderRow>, sqlx::Error> {
 	query_as::<_, ProviderRow>(
 		r#"
 		SELECT
@@ -115,7 +115,7 @@ async fn load_provider_rows(db: &sqlx::PgPool) -> Result<Vec<ProviderRow>, sqlx:
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(db)
+	.fetch_all(&mut *db)
 	.await
 }
 
@@ -505,10 +505,20 @@ pub async fn get_overview(
 	}))
 }
 
-pub async fn list_providers(State(state): State<AppState>) -> ServiceResult<ListProvidersResponse> {
-	let rows = load_provider_rows(&state.db)
+pub async fn list_providers(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListProvidersResponse> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let rows = load_provider_rows(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list providers commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 	Ok(Json(ListProvidersResponse {
 		data: rows.into_iter().map(Into::into).collect(),
 	}))
@@ -516,6 +526,7 @@ pub async fn list_providers(State(state): State<AppState>) -> ServiceResult<List
 
 pub async fn create_provider(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateProviderRequest>,
 ) -> ServiceResult<LlmProvider> {
 	if body.name.trim().is_empty() {
@@ -532,6 +543,10 @@ pub async fn create_provider(
 		..ProviderHealthState::default()
 	};
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let tenant_id = claims.tenant_scope_id();
 	let row = query_as::<_, ProviderRow>(
 		r#"
 		INSERT INTO ai_providers (
@@ -548,9 +563,10 @@ pub async fn create_provider(
 			cost_tier,
 			tags,
 			route_rules,
-			health_state
+			health_state,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING
 			id,
 			name,
@@ -584,19 +600,28 @@ pub async fn create_provider(
 	.bind(SqlJson(body.tags))
 	.bind(SqlJson(route_rules))
 	.bind(SqlJson(health_state))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create provider commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn update_provider(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(provider_id): Path<Uuid>,
 	Json(body): Json<UpdateProviderRequest>,
 ) -> ServiceResult<LlmProvider> {
-	let Some(current) = load_provider_row(&state.db, provider_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(current) = load_provider_row(&mut tx, provider_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -664,9 +689,13 @@ pub async fn update_provider(
 	.bind(SqlJson(body.tags.unwrap_or(provider.tags)))
 	.bind(SqlJson(body.route_rules.unwrap_or(provider.route_rules)))
 	.bind(SqlJson(health_state))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("update provider commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
@@ -745,7 +774,7 @@ pub async fn create_chat_completion(
 		.await
 		.map_err(|_| internal_error("tenant scope failed"))?;
 	let tenant_id = claims.tenant_scope_id();
-	let providers = load_provider_rows(&state.db)
+	let providers = load_provider_rows(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.into_iter()
@@ -911,7 +940,7 @@ pub async fn ask_copilot(
 		.await
 		.map_err(|_| internal_error("tenant scope failed"))?;
 	let tenant_id = claims.tenant_scope_id();
-	let providers = load_provider_rows(&state.db)
+	let providers = load_provider_rows(&mut tx)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.into_iter()

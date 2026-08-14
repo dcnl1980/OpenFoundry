@@ -1,8 +1,9 @@
+use auth_middleware::layer::AuthUser;
 use axum::{extract::State, Json};
 
 use crate::{
 	domain::{export, gdpr},
-	handlers::{db_error, internal_error, load_events, load_policies, load_reports, ServiceResult},
+	handlers::{db_error, internal_error, load_events, load_policies, load_reports, tenant::begin_scope, ServiceResult},
 	models::{
 		compliance_report::{ComplianceReport, ComplianceReportRequest, GdprEraseRequest, GdprEraseResponse, GdprExportPayload, GdprExportRequest},
 		ListResponse,
@@ -10,24 +11,30 @@ use crate::{
 	AppState,
 };
 
-pub async fn list_reports(State(state): State<AppState>) -> ServiceResult<ListResponse<ComplianceReport>> {
-	let reports = load_reports(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_reports(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<ComplianceReport>> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let reports = load_reports(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(ListResponse { items: reports }))
 }
 
 pub async fn generate_report(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<ComplianceReportRequest>,
 ) -> ServiceResult<ComplianceReport> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let policies = load_policies(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
+	let policies = load_policies(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	let report = export::build_report(&request, &events, &policies);
 	let findings = serde_json::to_value(&report.findings).map_err(|cause| internal_error(cause.to_string()))?;
 	let artifact = serde_json::to_value(&report.artifact).map_err(|cause| internal_error(cause.to_string()))?;
 
 	sqlx::query(
-		"INSERT INTO compliance_reports (id, standard, title, scope, window_start, window_end, generated_at, status, findings, artifact, relevant_event_count, policy_count, control_summary, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14)",
+		"INSERT INTO compliance_reports (id, standard, title, scope, window_start, window_end, generated_at, status, findings, artifact, relevant_event_count, policy_count, control_summary, expires_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15)",
 	)
 	.bind(report.id)
 	.bind(report.standard.as_str())
@@ -43,7 +50,8 @@ pub async fn generate_report(
 	.bind(report.policy_count)
 	.bind(&report.control_summary)
 	.bind(report.expires_at)
-	.execute(&state.db)
+	.bind(claims.tenant_scope_id())
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -52,17 +60,21 @@ pub async fn generate_report(
 
 pub async fn export_subject_data(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<GdprExportRequest>,
 ) -> ServiceResult<GdprExportPayload> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(gdpr::export_payload(&request, &events)))
 }
 
 pub async fn erase_subject_data(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<GdprEraseRequest>,
 ) -> ServiceResult<GdprEraseResponse> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	let response = gdpr::erase_response(&request, &events);
 
 	sqlx::query(
@@ -72,7 +84,7 @@ pub async fn erase_subject_data(
 	)
 	.bind(&request.subject_id)
 	.bind(request.legal_hold)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
