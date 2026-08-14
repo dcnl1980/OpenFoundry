@@ -26,8 +26,42 @@ pub struct JwtConfig {
     pub refresh_ttl_secs: i64,
 }
 
+const DEFAULT_JWT_SECRET: &str = "change-me-in-production-use-a-256-bit-key";
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+pub fn insecure_jwt_secret_reason(secret: &str) -> Option<&'static str> {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return Some("JWT_SECRET is empty");
+    }
+    if trimmed == DEFAULT_JWT_SECRET || trimmed.eq_ignore_ascii_case("secret") {
+        return Some("JWT_SECRET is a published default and must be replaced");
+    }
+    if trimmed.len() < MIN_JWT_SECRET_LEN {
+        return Some("JWT_SECRET must be at least 32 characters");
+    }
+    None
+}
+
+fn production_environment() -> bool {
+    matches!(
+        std::env::var("ENVIRONMENT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("production") | Some("prod")
+    )
+}
+
 impl JwtConfig {
     pub fn new(secret: &str) -> Self {
+        if production_environment() {
+            if let Some(reason) = insecure_jwt_secret_reason(secret) {
+                panic!("{reason} before starting in production");
+            }
+        }
         Self {
             secret: secret.as_bytes().to_vec(),
             access_ttl_secs: 3600,
@@ -171,5 +205,11 @@ mod tests {
         assert!(is_usable_access_token(None));
         assert!(!is_usable_access_token(Some("refresh")));
         assert!(!is_usable_access_token(Some("id")));
+    }
+
+    #[test]
+    fn default_jwt_secret_is_rejected_as_insecure() {
+        assert!(insecure_jwt_secret_reason(DEFAULT_JWT_SECRET).is_some());
+        assert!(insecure_jwt_secret_reason("abcdefghijklmnopqrstuvwxyz012345").is_none());
     }
 }

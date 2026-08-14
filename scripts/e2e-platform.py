@@ -221,6 +221,11 @@ def main() -> int:
     expect_status("users/me as A", status, {200}, f"status={status}")
     if isinstance(me, dict):
         record("users/me email matches A", me.get("email") == email_a, str(me.get("email")))
+        roles = me.get("roles")
+        record("register A is tenant admin", isinstance(roles, list) and "admin" in roles, str(roles))
+    status, me_b = request("GET", "/api/v1/users/me", token=token_b)
+    roles_b = me_b.get("roles") if isinstance(me_b, dict) else None
+    record("register B is tenant admin", isinstance(roles_b, list) and "admin" in roles_b, str(roles_b))
 
     status, refreshed = request("POST", "/api/v1/auth/refresh", body={"refresh_token": refresh_a})
     if status != 200:
@@ -247,12 +252,11 @@ def main() -> int:
     expect_status("auth create group as admin", status, {200, 201}, f"status={status} body={payload}")
     group_id = first_id(payload)
     status, groups_b = request("GET", "/api/v1/groups", token=token_b)
-    if status == 403:
-        record("viewer B cannot list groups", True, "forbidden as designed")
-    else:
-        expect_status("list groups as B", status, {200})
-        if group_id:
-            record("B cannot see A's group", group_id not in extract_ids(groups_b), str(extract_ids(groups_b)))
+    expect_status("list groups as B", status, {200, 403}, f"status={status}")
+    if status == 200 and group_id:
+        record("B cannot see A's group", group_id not in extract_ids(groups_b), str(extract_ids(groups_b)))
+    elif status == 403:
+        record("B cannot see A's group", True, "forbidden")
 
     status, key = request("POST", "/api/v1/api-keys", token=token_a, body={"name": "e2e-deploy"})
     expect_status("create API key as A", status, {200, 201}, f"status={status} body={key}")
@@ -541,6 +545,28 @@ def main() -> int:
     expect_status("notification list as B", status, {200}, f"status={status}")
     if first_id(note):
         record("B cannot see A's notification", first_id(note) not in extract_ids(notes_b), str(extract_ids(notes_b)))
+
+    status, providers = request("GET", "/api/v1/ai/providers", token=token_a)
+    expect_status("ai providers list as A", status, {200}, f"status={status}")
+    provider_names: list[str] = []
+    if isinstance(providers, dict):
+        provider_names = [
+            str(item.get("name"))
+            for item in providers.get("data", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+    record("A received cloned system AI providers", "OpenRouter" in provider_names, str(provider_names))
+
+    status, templates = request("GET", "/api/v1/apps/templates", token=token_a)
+    expect_status("app templates list as A", status, {200}, f"status={status}")
+    template_keys: list[str] = []
+    if isinstance(templates, dict):
+        template_keys = [
+            str(item.get("key"))
+            for item in templates.get("data", [])
+            if isinstance(item, dict) and item.get("key")
+        ]
+    record("A received cloned system app templates", "ops-center" in template_keys, str(template_keys))
 
     for path, label in (
         ("/api/v1/ai/overview", "ai overview"),

@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::domain::jwt::issue_tokens;
 use crate::domain::mfa;
+use crate::domain::rbac;
 use crate::handlers::tenant::begin_tenant_id;
 use crate::models::mfa::TotpConfiguration;
 use crate::models::user::User;
@@ -95,6 +96,23 @@ pub async fn login(
 
     if !verify_password(&body.password, &user.password_hash) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid credentials" })))
+            .into_response();
+    }
+
+    if let Err(e) = rbac::ensure_bootstrap_admin(
+        &mut tx,
+        user.id,
+        tenant_id,
+        &user.email,
+        state.bootstrap_admin_email.as_deref(),
+    )
+    .await
+    {
+        tracing::error!("failed to apply bootstrap admin: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "login failed" })),
+        )
             .into_response();
     }
 

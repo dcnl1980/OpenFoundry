@@ -64,7 +64,11 @@ This data-plane boundary is enforced on tenant-owned tables in ontology, query, 
 
 Auth login/register/SSO public entry points look up a user or provider through `SECURITY DEFINER` helpers, then reopen a tenant transaction. Email and SSO slugs stay globally unique so those lookups stay unambiguous. System roles (`admin`, `editor`, `viewer`) remain readable inside every tenant.
 
-Services migrate with `MIGRATION_DATABASE_URL` (owner/superuser) and serve traffic through `DATABASE_URL` as `openfoundry_app`. `connect_runtime_pool` refuses `SUPERUSER` and `BYPASSRLS` roles because those skip `FORCE ROW LEVEL SECURITY`.
+Services migrate with `MIGRATION_DATABASE_URL` (owner/superuser) and serve traffic through `DATABASE_URL` as `openfoundry_app`. `connect_runtime_pool` refuses `SUPERUSER` and `BYPASSRLS` roles because those skip `FORCE ROW LEVEL SECURITY`. Each service has its own database (`openfoundry_auth`, `openfoundry_ai`, …). Sharing one database collides on `_sqlx_migrations`.
+
+The first user in a tenant is granted `admin`. Later users in that tenant receive `viewer`. Optional `BOOTSTRAP_ADMIN_EMAIL` promotes a named operator on register or next login.
+
+Empty AI and app-builder catalogs clone the system tenant (`00000000-0000-0000-0000-000000000001`) into the caller’s tenant through `SECURITY DEFINER` helpers. Cloned rows get new ids and stay behind RLS.
 
 Scheduled pipeline and workflow workers discover due rows through `SECURITY DEFINER` functions (`openfoundry_due_pipelines`, `openfoundry_due_workflows`), then reopen a normal tenant transaction per row. The runtime role must still be `openfoundry_app` (`NOSUPERUSER NOBYPASSRLS`); the owner/superuser role bypasses RLS.
 
@@ -84,7 +88,7 @@ Scheduled pipeline and workflow workers discover due rows through `SECURITY DEFI
    | `x-openfoundry-quota-requests-per-minute` | tier / `tenant_quotas` |
 
 5. Hop-by-hop headers (`host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade`, `te`, `proxy-*`, plus names listed in `Connection`) are not forwarded.
-6. Downstream services may read those headers only after the hop is authenticated. In production, set `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `TLS_CA_PATH` on every service and the gateway so the hop is **mTLS**: services present a server cert, the gateway presents a client cert, and both verify the shared CA. Without those three variables the process logs a warning and serves plaintext HTTP (development only).
+6. Downstream services may read those headers only after the hop is authenticated. Set `ENVIRONMENT=production` together with `TLS_CERT_PATH`, `TLS_KEY_PATH`, and `TLS_CA_PATH` on every service and the gateway so the hop is **mTLS**: services present a server cert, the gateway presents a client cert, and both verify the shared CA. Production refuses to start without those three variables or with the published default `JWT_SECRET`. Without TLS in development the process logs a warning and serves plaintext HTTP.
 7. Every domain service now starts through `service_runtime::serve`, which applies a 10 MiB default body limit and the same TLS mode. Service-to-service HTTP clients (gateway, ontology, workflow, notification) load the same client identity and CA.
 8. Domain `auth_layer` rejects refresh tokens. Protected routes already require a JWT; mTLS is what stops a caller from bypassing the gateway and talking to a service port directly.
 

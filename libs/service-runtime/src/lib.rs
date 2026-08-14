@@ -9,6 +9,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 
+pub mod production;
+
 const DEFAULT_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -212,6 +214,11 @@ pub async fn serve(app: Router, addr: &str, settings: TlsSettings) -> Result<(),
 	let addr: SocketAddr = addr
 		.parse()
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+	if let Err(reason) =
+		production::validate_tls_for_environment(settings.mode(), production::RuntimeEnvironment::from_env())
+	{
+		return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, reason));
+	}
 
 	match settings.mode() {
 		TlsMode::Disabled => {

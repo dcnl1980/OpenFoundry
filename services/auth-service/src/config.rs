@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub nats_url: Option<String>,
     #[serde(default)]
     pub redis_url: Option<String>,
+    /// When set, this email is granted admin on register/login (one-shot first operator).
+    #[serde(default)]
+    pub bootstrap_admin_email: Option<String>,
 }
 
 fn default_host() -> String {

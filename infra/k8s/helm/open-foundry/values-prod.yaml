@@ -1,25 +1,40 @@
+global:
+  environment: production
+  jwt:
+    existingSecret: openfoundry-jwt
+    value: ""
+  database:
+    existingSecret: openfoundry-db
+  tls:
+    enabled: true
+    secretName: openfoundry-mtls
+  # Set to the first operator email so that account becomes admin on next login.
+  bootstrapAdminEmail: ""
+
 services:
-	gateway:
-		autoscaling:
-			minReplicas: 3
-			maxReplicas: 12
-	query-service:
-		env:
-			DISTRIBUTED_QUERY_WORKERS: "8"
-		autoscaling:
-			minReplicas: 4
-			maxReplicas: 20
-			keda:
-				enabled: true
-	pipeline-service:
-		env:
-			DISTRIBUTED_PIPELINE_WORKERS: "8"
-		autoscaling:
-			minReplicas: 3
-			maxReplicas: 16
-			keda:
-				enabled: true
-	geospatial-service:
-		autoscaling:
-			minReplicas: 3
-			maxReplicas: 10
+  gateway:
+    autoscaling:
+      minReplicas: 3
+      maxReplicas: 12
+  query-service:
+    env:
+      RUST_LOG: info
+      DISTRIBUTED_QUERY_WORKERS: "8"
+    autoscaling:
+      minReplicas: 4
+      maxReplicas: 20
+      keda:
+        enabled: true
+  pipeline-service:
+    env:
+      RUST_LOG: info
+      DISTRIBUTED_PIPELINE_WORKERS: "8"
+    autoscaling:
+      minReplicas: 3
+      maxReplicas: 16
+      keda:
+        enabled: true
+  geospatial-service:
+    autoscaling:
+      minReplicas: 3
+      maxReplicas: 10

@@ -28,10 +28,17 @@ The `main` branch is the supported line until a numbered release exists.
 
 - `JWT_SECRET` and database credentials are environment-only. Do not commit them.
 - Service TLS material (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_CA_PATH`) enables mTLS between the gateway and services.
+- `ENVIRONMENT=production` (or `prod`) refuses the published default JWT secret, secrets shorter than 32 characters, and plaintext HTTP. Production must use mTLS.
+
+## First operator
+
+- A self-registered user creates a new tenant and is granted `admin` for that tenant.
+- Later users in the same tenant (SSO into an existing org) receive `viewer`.
+- `BOOTSTRAP_ADMIN_EMAIL` grants `admin` to that address on register or the next login. Unset it after the first operator is in.
 
 ## Encryption and transport
 
-- Production hops should use mTLS (`service-runtime`). Plaintext HTTP is development-only and logs a warning.
+- Production hops must use mTLS (`service-runtime`). Plaintext HTTP is development-only and logs a warning.
 - Tokens are HMAC-SHA256 JWTs.
 
 ## Dependencies

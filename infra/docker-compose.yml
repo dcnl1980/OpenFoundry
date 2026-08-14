@@ -19,6 +19,7 @@ services:
       POSTGRES_USER: openfoundry
       POSTGRES_PASSWORD: openfoundry
       POSTGRES_DB: openfoundry
+      POSTGRES_MULTIPLE_DATABASES: "openfoundry_auth,openfoundry_connector,openfoundry_dataset,openfoundry_streaming,openfoundry_query,openfoundry_pipeline,openfoundry_ontology,openfoundry_fusion,openfoundry_ml,openfoundry_ai,openfoundry_workflow,openfoundry_notebook,openfoundry_apps,openfoundry_report,openfoundry_code,openfoundry_market,openfoundry_nexus,openfoundry_geo,openfoundry_notify,openfoundry_audit"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d

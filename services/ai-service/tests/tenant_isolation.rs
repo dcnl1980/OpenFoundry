@@ -190,3 +190,42 @@ async fn tenant_b_cannot_see_tenant_a_provider_or_tool() {
     assert_eq!(tool, None);
     assert_eq!(deleted, 0);
 }
+
+#[tokio::test]
+async fn empty_tenant_receives_its_own_clone_of_system_catalog() {
+    let pool = pool().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+
+    let mut tx_a = begin_tenant_transaction(&pool, tenant_a).await.expect("a");
+    sqlx::query("SELECT openfoundry_clone_system_ai_catalog()")
+        .execute(&mut *tx_a)
+        .await
+        .expect("clone a");
+    let names_a: Vec<String> = sqlx::query_scalar("SELECT name FROM ai_providers ORDER BY name")
+        .fetch_all(&mut *tx_a)
+        .await
+        .expect("list a");
+    let ids_a: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM ai_providers")
+        .fetch_all(&mut *tx_a)
+        .await
+        .expect("ids a");
+    tx_a.commit().await.expect("commit a");
+    assert!(
+        names_a.iter().any(|name| name == "OpenRouter"),
+        "expected system provider clone, got {names_a:?}"
+    );
+
+    let mut tx_b = begin_tenant_transaction(&pool, tenant_b).await.expect("b");
+    sqlx::query("SELECT openfoundry_clone_system_ai_catalog()")
+        .execute(&mut *tx_b)
+        .await
+        .expect("clone b");
+    let ids_b: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM ai_providers")
+        .fetch_all(&mut *tx_b)
+        .await
+        .expect("ids b");
+    let leaked = ids_b.iter().any(|id| ids_a.contains(id));
+    assert!(!leaked, "tenant B must not see tenant A's cloned row ids");
+    tx_b.commit().await.expect("commit b");
+}

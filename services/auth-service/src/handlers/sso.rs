@@ -180,7 +180,18 @@ pub async fn complete_login(
         Err(error) => return json_error(StatusCode::BAD_GATEWAY, error),
     };
 
-    let user = match find_or_create_sso_user(&mut tx, lookup.1, &provider, &subject, &email, &name, &userinfo).await {
+    let user = match find_or_create_sso_user(
+        &mut tx,
+        lookup.1,
+        &provider,
+        &subject,
+        &email,
+        &name,
+        &userinfo,
+        state.bootstrap_admin_email.as_deref(),
+    )
+    .await
+    {
         Ok(user) => user,
         Err(e) => {
             tracing::error!("failed to materialize SSO user: {e}");
@@ -435,6 +446,7 @@ async fn find_or_create_sso_user(
     email: &str,
     name: &str,
     raw_claims: &Value,
+    bootstrap_admin_email: Option<&str>,
 ) -> Result<User, sqlx::Error> {
     if let Some(user) = sqlx::query_as::<_, User>(
         r#"SELECT u.id, u.email, u.name, u.password_hash, u.is_active, u.organization_id, u.attributes, u.mfa_enforced, u.auth_source, u.created_at, u.updated_at
@@ -447,6 +459,8 @@ async fn find_or_create_sso_user(
     .fetch_optional(&mut *conn)
     .await?
     {
+        rbac::ensure_bootstrap_admin(conn, user.id, tenant_id, &user.email, bootstrap_admin_email)
+            .await?;
         return Ok(user);
     }
 
@@ -457,6 +471,14 @@ async fn find_or_create_sso_user(
     .fetch_optional(&mut *conn)
     .await?
     {
+        rbac::ensure_bootstrap_admin(
+            conn,
+            existing_user.id,
+            tenant_id,
+            &existing_user.email,
+            bootstrap_admin_email,
+        )
+        .await?;
         existing_user
     } else {
         let user_id = Uuid::now_v7();
@@ -471,9 +493,7 @@ async fn find_or_create_sso_user(
         .execute(&mut *conn)
         .await?;
 
-        if let Some(viewer_role) = rbac::get_role_by_name(&mut *conn, "viewer").await? {
-            let _ = rbac::assign_role(&mut *conn, user_id, viewer_role.id).await;
-        }
+        rbac::assign_founding_role(conn, user_id, tenant_id, email, bootstrap_admin_email).await?;
 
         sqlx::query_as::<_, User>(
             "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",

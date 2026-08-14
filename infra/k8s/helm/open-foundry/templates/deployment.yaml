@@ -1,4 +1,5 @@
 {{- range $serviceName, $service := .Values.services }}
+{{- $service := mergeOverwrite (deepCopy $.Values.serviceDefaults) $service }}
 {{- if $service.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -31,18 +32,107 @@ spec:
     spec:
       containers:
         - name: {{ $serviceName }}
-          image: "{{ $service.image.repository }}:{{ $service.image.tag }}"
+          image: "{{ default (printf "ghcr.io/open-foundry/%s" $serviceName) $service.image.repository }}:{{ default $.Values.global.imageTag $service.image.tag }}"
           imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
           ports:
             - name: http
               containerPort: {{ $service.port }}
           env:
+            - name: ENVIRONMENT
+              value: {{ $.Values.global.environment | quote }}
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ $service.port | quote }}
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-foundry.jwtSecretName" $ }}
+                  key: {{ $.Values.global.jwt.secretKey }}
+{{- if $.Values.global.redisUrl }}
+            - name: REDIS_URL
+              value: {{ $.Values.global.redisUrl | quote }}
+{{- end }}
+{{- if $.Values.global.natsUrl }}
+            - name: NATS_URL
+              value: {{ $.Values.global.natsUrl | quote }}
+{{- end }}
+{{- if $service.database }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-foundry.dbSecretName" $ }}
+                  key: {{ include "open-foundry.databaseUrlKey" $serviceName }}
+            - name: MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-foundry.dbSecretName" $ }}
+                  key: {{ include "open-foundry.migrationUrlKey" $serviceName }}
+{{- end }}
+{{- if $.Values.global.tls.enabled }}
+            - name: TLS_CERT_PATH
+              value: {{ printf "%s/%s" $.Values.global.tls.mountPath $.Values.global.tls.certFile | quote }}
+            - name: TLS_KEY_PATH
+              value: {{ printf "%s/%s" $.Values.global.tls.mountPath $.Values.global.tls.keyFile | quote }}
+            - name: TLS_CA_PATH
+              value: {{ printf "%s/%s" $.Values.global.tls.mountPath $.Values.global.tls.caFile | quote }}
+{{- end }}
+{{- if eq $serviceName "gateway" }}
+{{- range $upstreamName, $upstream := $.Values.services }}
+{{- $upstreamMerged := mergeOverwrite (deepCopy $.Values.serviceDefaults) $upstream }}
+{{- if and (ne $upstreamName "gateway") $upstreamMerged.enabled }}
+            - name: {{ include "open-foundry.upstreamEnv" $upstreamName }}
+              value: {{ include "open-foundry.upstreamUrl" (dict "root" $ "serviceName" $upstreamName "port" $upstreamMerged.port) | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and (eq $serviceName "auth-service") $.Values.global.bootstrapAdminEmail }}
+            - name: BOOTSTRAP_ADMIN_EMAIL
+              value: {{ $.Values.global.bootstrapAdminEmail | quote }}
+{{- end }}
 {{- range $envKey, $envValue := $service.env }}
             - name: {{ $envKey }}
               value: {{ $envValue | quote }}
 {{- end }}
+{{- if $.Values.global.tls.enabled }}
+          volumeMounts:
+            - name: mtls
+              mountPath: {{ $.Values.global.tls.mountPath }}
+              readOnly: true
+{{- end }}
+{{- if $.Values.global.tls.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+{{- else }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+{{- end }}
           resources:
 {{ toYaml $service.resources | indent 12 }}
+{{- if $.Values.global.tls.enabled }}
+      volumes:
+        - name: mtls
+          secret:
+            secretName: {{ $.Values.global.tls.secretName }}
+{{- end }}
 ---
 {{- end }}
 {{- end }}

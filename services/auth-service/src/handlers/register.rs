@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::domain::rbac;
 use crate::handlers::tenant::begin_tenant_id;
 
 #[derive(Debug, Deserialize)]
@@ -69,15 +70,17 @@ pub async fn register(
     .await;
 
     if result.is_ok() {
-        let _ = sqlx::query(
-            r#"INSERT INTO user_roles (user_id, role_id, tenant_id)
-               SELECT $1, id, $2 FROM roles WHERE name = 'viewer'
-               ON CONFLICT DO NOTHING"#,
+        if let Err(e) = rbac::assign_founding_role(
+            &mut tx,
+            user_id,
+            tenant_id,
+            &body.email,
+            state.bootstrap_admin_email.as_deref(),
         )
-        .bind(user_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await;
+        .await
+        {
+            tracing::error!("failed to assign founding role: {e}");
+        }
     }
 
     match result {

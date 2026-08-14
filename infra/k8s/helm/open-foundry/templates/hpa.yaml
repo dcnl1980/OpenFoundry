@@ -1,4 +1,5 @@
 {{- range $serviceName, $service := .Values.services }}
+{{- $service := mergeOverwrite (deepCopy $.Values.serviceDefaults) $service }}
 {{- if and $service.enabled $service.autoscaling.enabled }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

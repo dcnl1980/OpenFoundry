@@ -4,7 +4,7 @@ version: "3.9"
 services:
   postgres:
     environment:
-      POSTGRES_MULTIPLE_DATABASES: "openfoundry_auth,openfoundry_datasets,openfoundry_pipelines,openfoundry_ontology,openfoundry_audit"
+      POSTGRES_MULTIPLE_DATABASES: "openfoundry_auth,openfoundry_connector,openfoundry_dataset,openfoundry_streaming,openfoundry_query,openfoundry_pipeline,openfoundry_ontology,openfoundry_fusion,openfoundry_ml,openfoundry_ai,openfoundry_workflow,openfoundry_notebook,openfoundry_apps,openfoundry_report,openfoundry_code,openfoundry_market,openfoundry_nexus,openfoundry_geo,openfoundry_notify,openfoundry_audit"
     ports:
       - "5432:5432"
 

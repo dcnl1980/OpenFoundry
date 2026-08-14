@@ -17,6 +17,7 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub jwt_config: JwtConfig,
     pub public_web_origin: String,
+    pub bootstrap_admin_email: Option<String>,
 }
 
 #[tokio::main]
@@ -49,6 +50,7 @@ async fn main() {
         db: pool,
         jwt_config: jwt_config.clone(),
         public_web_origin: cfg.public_web_origin.clone(),
+        bootstrap_admin_email: cfg.bootstrap_admin_email.clone(),
     };
 
     // Public routes (no auth required)
