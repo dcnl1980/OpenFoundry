@@ -11,19 +11,30 @@ use crate::models::property::{CreatePropertyRequest, Property};
 use crate::AppState;
 use auth_middleware::layer::AuthUser;
 
+use super::tenant::begin_scope;
+
 pub async fn list_properties(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(type_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Property>(
         r#"SELECT * FROM properties WHERE object_type_id = $1 ORDER BY created_at ASC"#,
     )
     .bind(type_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     {
-        Ok(properties) => Json(properties).into_response(),
+        Ok(properties) => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            Json(properties).into_response()
+        }
         Err(e) => {
             tracing::error!("list properties: {e}");
             super::db_failure(&e)
@@ -32,7 +43,7 @@ pub async fn list_properties(
 }
 
 pub async fn create_property(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(type_id): Path<Uuid>,
     Json(body): Json<CreatePropertyRequest>,
@@ -41,12 +52,16 @@ pub async fn create_property(
         Ok(prepared) => prepared,
         Err(message) => return super::json_error(StatusCode::BAD_REQUEST, message),
     };
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
 
     let object_type_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM object_types WHERE id = $1)",
     )
     .bind(type_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match object_type_exists {
@@ -62,9 +77,9 @@ pub async fn create_property(
     let result = sqlx::query_as::<_, Property>(
         r#"INSERT INTO properties (
                id, object_type_id, name, display_name, description, property_type,
-               required, unique_constraint, default_value, validation_rules
+               required, unique_constraint, default_value, validation_rules, tenant_id
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *"#,
     )
     .bind(id)
@@ -77,11 +92,17 @@ pub async fn create_property(
     .bind(prepared.unique_constraint)
     .bind(&prepared.default_value)
     .bind(&prepared.validation_rules)
-    .fetch_one(&state.db)
+    .bind(claims.tenant_scope_id())
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(property) => (StatusCode::CREATED, Json(property)).into_response(),
+        Ok(property) => {
+            if let Err(error) = tx.commit().await {
+                return super::db_failure(&error);
+            }
+            (StatusCode::CREATED, Json(property)).into_response()
+        }
         Err(e) => {
             tracing::error!("create property: {e}");
             super::db_failure(&e)

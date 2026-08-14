@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -13,12 +14,20 @@ use crate::{
     },
     AppState,
 };
+use auth_middleware::layer::AuthUser;
+
+use super::tenant::begin_scope;
 
 pub async fn list_branches(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(dataset_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let dataset = match load_dataset(&state, dataset_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let dataset = match load_dataset(&mut tx, dataset_id).await {
         Ok(Some(dataset)) => dataset,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -27,7 +36,7 @@ pub async fn list_branches(
         }
     };
 
-    if let Err(error) = ensure_default_branch(&state, &dataset).await {
+    if let Err(error) = ensure_default_branch(&mut tx, &dataset).await {
         tracing::error!("ensure default branch failed: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -38,10 +47,16 @@ pub async fn list_branches(
            ORDER BY is_default DESC, name ASC"#,
     )
     .bind(dataset_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     {
-        Ok(branches) => Json(branches).into_response(),
+        Ok(branches) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("list branches commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(branches).into_response()
+        }
         Err(error) => {
             tracing::error!("list branches failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -51,14 +66,23 @@ pub async fn list_branches(
 
 pub async fn create_branch(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(dataset_id): Path<Uuid>,
     Json(body): Json<CreateDatasetBranchRequest>,
 ) -> impl IntoResponse {
     if body.name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "branch name is required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "branch name is required" })),
+        )
+            .into_response();
     }
 
-    let dataset = match load_dataset(&state, dataset_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let dataset = match load_dataset(&mut tx, dataset_id).await {
         Ok(Some(dataset)) => dataset,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -67,7 +91,7 @@ pub async fn create_branch(
         }
     };
 
-    if let Err(error) = ensure_default_branch(&state, &dataset).await {
+    if let Err(error) = ensure_default_branch(&mut tx, &dataset).await {
         tracing::error!("ensure default branch failed: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -80,7 +104,7 @@ pub async fn create_branch(
     )
     .bind(dataset_id)
     .bind(source_version)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(false);
 
@@ -104,23 +128,38 @@ pub async fn create_branch(
     .bind(body.name.trim())
     .bind(source_version)
     .bind(body.description.unwrap_or_default())
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(branch) => (StatusCode::CREATED, Json(branch)).into_response(),
+        Ok(branch) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("create branch commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            (StatusCode::CREATED, Json(branch)).into_response()
+        }
         Err(error) => {
             tracing::error!("create branch failed: {error}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error.to_string() }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
         }
     }
 }
 
 pub async fn checkout_branch(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path((dataset_id, branch_name)): Path<(Uuid, String)>,
 ) -> impl IntoResponse {
-    let dataset = match load_dataset(&state, dataset_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let dataset = match load_dataset(&mut tx, dataset_id).await {
         Ok(Some(dataset)) => dataset,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -129,7 +168,7 @@ pub async fn checkout_branch(
         }
     };
 
-    if let Err(error) = ensure_default_branch(&state, &dataset).await {
+    if let Err(error) = ensure_default_branch(&mut tx, &dataset).await {
         tracing::error!("ensure default branch failed: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -140,7 +179,7 @@ pub async fn checkout_branch(
     )
     .bind(dataset_id)
     .bind(&branch_name)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(branch)) => branch,
@@ -162,10 +201,16 @@ pub async fn checkout_branch(
     .bind(dataset_id)
     .bind(&branch.name)
     .bind(branch.version)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     {
-        Ok(dataset) => Json(dataset).into_response(),
+        Ok(dataset) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("checkout branch commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(dataset).into_response()
+        }
         Err(error) => {
             tracing::error!("checkout branch update failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -173,12 +218,15 @@ pub async fn checkout_branch(
     }
 }
 
-async fn ensure_default_branch(state: &AppState, dataset: &Dataset) -> Result<(), sqlx::Error> {
+async fn ensure_default_branch(
+    tx: &mut Transaction<'_, Postgres>,
+    dataset: &Dataset,
+) -> Result<(), sqlx::Error> {
     let has_branches = sqlx::query_scalar::<_, bool>(
         r#"SELECT EXISTS(SELECT 1 FROM dataset_branches WHERE dataset_id = $1)"#,
     )
     .bind(dataset.id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut **tx)
     .await?;
 
     if !has_branches {
@@ -191,7 +239,7 @@ async fn ensure_default_branch(state: &AppState, dataset: &Dataset) -> Result<()
         .bind(Uuid::now_v7())
         .bind(dataset.id)
         .bind(dataset.current_version)
-        .execute(&state.db)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -199,11 +247,11 @@ async fn ensure_default_branch(state: &AppState, dataset: &Dataset) -> Result<()
 }
 
 async fn load_dataset(
-    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     dataset_id: Uuid,
 ) -> Result<Option<Dataset>, sqlx::Error> {
     sqlx::query_as::<_, Dataset>("SELECT * FROM datasets WHERE id = $1")
         .bind(dataset_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut **tx)
         .await
 }

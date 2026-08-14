@@ -43,6 +43,8 @@ pub struct FileRow {
 	pub size_bytes: i32,
 	pub content: String,
 	pub last_commit_sha: String,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<FileRow> for RepositoryFile {

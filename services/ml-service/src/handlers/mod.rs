@@ -4,6 +4,7 @@ pub mod features;
 pub mod models;
 pub mod overview;
 pub mod predictions;
+pub mod tenant;
 pub mod training;
 
 use axum::{http::StatusCode, Json};

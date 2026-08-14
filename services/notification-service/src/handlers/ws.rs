@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
 };
 use axum::extract::ws::{Message, WebSocket};
+use auth_middleware::begin_tenant_transaction;
 
 use crate::{
     handlers::send::{latest_notifications, unread_count},
@@ -21,20 +22,30 @@ pub async fn notifications_ws(
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    ws.on_upgrade(move |socket| websocket_loop(socket, state, claims.sub))
+    ws.on_upgrade(move |socket| websocket_loop(socket, state, claims))
 }
 
 async fn websocket_loop(
     mut socket: WebSocket,
     state: AppState,
-    user_id: uuid::Uuid,
+    claims: auth_middleware::Claims,
 ) {
-    let notifications = latest_notifications(&state, user_id, 20).await.unwrap_or_default();
-    let unread = unread_count(&state, Some(user_id)).await.unwrap_or(0);
+    let user_id = claims.sub;
+    let notifications = match begin_tenant_transaction(&state.db, claims.tenant_scope_id()).await {
+        Ok(mut tx) => {
+            let notifications = latest_notifications(&mut tx, user_id, 20)
+                .await
+                .unwrap_or_default();
+            let unread = unread_count(&mut tx, Some(user_id)).await.unwrap_or(0);
+            let _ = tx.commit().await;
+            (notifications, unread)
+        }
+        Err(_) => (Vec::new(), 0),
+    };
     let snapshot = serde_json::json!({
         "kind": "snapshot",
-        "data": notifications,
-        "unread_count": unread,
+        "data": notifications.0,
+        "unread_count": notifications.1,
     });
 
     if socket

@@ -13,6 +13,7 @@ pub struct ObjectType {
     pub icon: Option<String>,
     pub color: Option<String>,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

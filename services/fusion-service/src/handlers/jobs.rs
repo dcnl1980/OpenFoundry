@@ -3,7 +3,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use sqlx::{query_as, query_scalar, types::Json as SqlJson};
+use sqlx::{query_as, query_scalar, types::Json as SqlJson, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -24,10 +24,14 @@ use crate::{
     },
     AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, not_found, ServiceResult};
+use super::{bad_request, db_error, not_found, tenant::begin_scope, ServiceResult};
 
-async fn load_job_row(db: &sqlx::PgPool, job_id: Uuid) -> Result<Option<FusionJobRow>, sqlx::Error> {
+async fn load_job_row(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+) -> Result<Option<FusionJobRow>, sqlx::Error> {
     query_as::<_, FusionJobRow>(
         r#"
         SELECT
@@ -49,12 +53,12 @@ async fn load_job_row(db: &sqlx::PgPool, job_id: Uuid) -> Result<Option<FusionJo
         "#,
     )
     .bind(job_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 async fn load_rule_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     rule_id: Uuid,
 ) -> Result<Option<MatchRuleRow>, sqlx::Error> {
     query_as::<_, MatchRuleRow>(
@@ -76,12 +80,12 @@ async fn load_rule_row(
         "#,
     )
     .bind(rule_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
 async fn load_merge_strategy_row(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     strategy_id: Uuid,
 ) -> Result<Option<MergeStrategyRow>, sqlx::Error> {
     query_as::<_, MergeStrategyRow>(
@@ -101,47 +105,52 @@ async fn load_merge_strategy_row(
         "#,
     )
     .bind(strategy_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
 }
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<FusionOverview> {
+pub async fn get_overview(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> ServiceResult<FusionOverview> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rule_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM fusion_match_rules")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     let active_job_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM fusion_jobs WHERE status IN ('draft', 'running', 'awaiting_review')",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
     let completed_job_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM fusion_jobs WHERE status IN ('completed', 'awaiting_review')",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
     let cluster_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM fusion_clusters")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     let pending_review_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM fusion_review_queue WHERE status = 'pending'",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
     let golden_record_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM fusion_golden_records")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     let auto_merged_cluster_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM fusion_clusters WHERE status = 'resolved' AND requires_review = FALSE",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(FusionOverview {
         rule_count,
@@ -154,7 +163,11 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<Fusion
     }))
 }
 
-pub async fn list_jobs(State(state): State<AppState>) -> ServiceResult<ListResponse<FusionJob>> {
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<FusionJob>> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let rows = query_as::<_, FusionJobRow>(
         r#"
         SELECT
@@ -175,9 +188,10 @@ pub async fn list_jobs(State(state): State<AppState>) -> ServiceResult<ListRespo
         ORDER BY updated_at DESC, created_at DESC
         "#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(ListResponse {
         data: rows.into_iter().map(Into::into).collect(),
@@ -186,17 +200,20 @@ pub async fn list_jobs(State(state): State<AppState>) -> ServiceResult<ListRespo
 
 pub async fn create_job(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Json(body): Json<CreateFusionJobRequest>,
 ) -> ServiceResult<FusionJob> {
     if body.name.trim().is_empty() {
         return Err(bad_request("job name is required"));
     }
 
-    let rule_exists = load_rule_row(&state.db, body.match_rule_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let tenant_id = claims.tenant_scope_id();
+    let rule_exists = load_rule_row(&mut tx, body.match_rule_id)
         .await
         .map_err(|cause| db_error(&cause))?
         .is_some();
-    let strategy_exists = load_merge_strategy_row(&state.db, body.merge_strategy_id)
+    let strategy_exists = load_merge_strategy_row(&mut tx, body.merge_strategy_id)
         .await
         .map_err(|cause| db_error(&cause))?
         .is_some();
@@ -217,9 +234,10 @@ pub async fn create_job(
             config,
             metrics,
             last_run_summary,
-            last_run_at
+            last_run_at,
+            tenant_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Not run yet', NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Not run yet', NULL, $10)
         RETURNING
             id,
             name,
@@ -245,30 +263,35 @@ pub async fn create_job(
     .bind(body.merge_strategy_id)
     .bind(SqlJson(body.config.unwrap_or_default()))
     .bind(SqlJson(FusionJobMetrics::default()))
-    .fetch_one(&state.db)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(row.into()))
 }
 
 pub async fn run_job(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(job_id): Path<Uuid>,
 ) -> ServiceResult<RunResolutionJobResponse> {
-    let Some(job_row) = load_job_row(&state.db, job_id)
+    let mut tx = begin_scope(&state, &claims).await?;
+    let tenant_id = claims.tenant_scope_id();
+    let Some(job_row) = load_job_row(&mut tx, job_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
         return Err(not_found("fusion job not found"));
     };
-    let Some(rule_row) = load_rule_row(&state.db, job_row.match_rule_id)
+    let Some(rule_row) = load_rule_row(&mut tx, job_row.match_rule_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
         return Err(not_found("match rule not found"));
     };
-    let Some(strategy_row) = load_merge_strategy_row(&state.db, job_row.merge_strategy_id)
+    let Some(strategy_row) = load_merge_strategy_row(&mut tx, job_row.merge_strategy_id)
         .await
         .map_err(|cause| db_error(&cause))?
     else {
@@ -327,7 +350,7 @@ pub async fn run_job(
 
     sqlx::query("DELETE FROM fusion_clusters WHERE job_id = $1")
         .bind(job.id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
@@ -345,9 +368,10 @@ pub async fn run_job(
                 requires_review,
                 suggested_golden_record_id,
                 created_at,
-                updated_at
+                updated_at,
+                tenant_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(cluster.id)
@@ -361,7 +385,8 @@ pub async fn run_job(
         .bind(cluster.suggested_golden_record_id)
         .bind(cluster.created_at)
         .bind(cluster.updated_at)
-        .execute(&state.db)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     }
@@ -379,9 +404,10 @@ pub async fn run_job(
                 confidence_score,
                 status,
                 created_at,
-                updated_at
+                updated_at,
+                tenant_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(golden_record.id)
@@ -394,7 +420,8 @@ pub async fn run_job(
         .bind(&golden_record.status)
         .bind(golden_record.created_at)
         .bind(golden_record.updated_at)
-        .execute(&state.db)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     }
@@ -413,9 +440,10 @@ pub async fn run_job(
                 reviewed_by,
                 notes,
                 created_at,
-                updated_at
+                updated_at,
+                tenant_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(review_item.id)
@@ -429,7 +457,8 @@ pub async fn run_job(
         .bind(&review_item.notes)
         .bind(review_item.created_at)
         .bind(review_item.updated_at)
-        .execute(&state.db)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
     }
@@ -495,9 +524,10 @@ pub async fn run_job(
         golden_records.len(),
         review_items.len(),
     ))
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(Json(RunResolutionJobResponse {
         job: updated_row.into(),

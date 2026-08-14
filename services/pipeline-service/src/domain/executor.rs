@@ -1,8 +1,10 @@
 use std::{collections::HashSet, str::FromStr};
 
+use auth_middleware::{begin_tenant_transaction, fetch_due_work};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde_json::{json, Value};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -28,6 +30,38 @@ pub async fn start_pipeline_run(
     distributed_worker_count: usize,
     context: Value,
 ) -> Result<PipelineRun, String> {
+    let mut tx = begin_tenant_transaction(&state.db, pipeline.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let run = start_pipeline_run_in_tx(
+        state,
+        &mut tx,
+        pipeline,
+        started_by,
+        trigger_type,
+        from_node_id,
+        retry_of_run_id,
+        attempt_number,
+        distributed_worker_count,
+        context,
+    )
+    .await?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(run)
+}
+
+async fn start_pipeline_run_in_tx(
+    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
+    pipeline: &Pipeline,
+    started_by: Option<Uuid>,
+    trigger_type: &str,
+    from_node_id: Option<String>,
+    retry_of_run_id: Option<Uuid>,
+    attempt_number: i32,
+    distributed_worker_count: usize,
+    context: Value,
+) -> Result<PipelineRun, String> {
     let nodes = pipeline.parsed_nodes()?;
     if nodes.is_empty() {
         return Err("pipeline must define at least one node".into());
@@ -37,9 +71,9 @@ pub async fn start_pipeline_run(
 
     let run = sqlx::query_as::<_, PipelineRun>(
         r#"INSERT INTO pipeline_runs (
-               id, pipeline_id, status, trigger_type, started_by, attempt_number, started_from_node_id, retry_of_run_id, execution_context
+               id, pipeline_id, status, trigger_type, started_by, attempt_number, started_from_node_id, retry_of_run_id, execution_context, tenant_id
            )
-           VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8)
+           VALUES ($1, $2, 'running', $3, $4, $5, $6, $7, $8, $9)
            RETURNING *"#,
     )
     .bind(Uuid::now_v7())
@@ -50,7 +84,8 @@ pub async fn start_pipeline_run(
     .bind(&from_node_id)
     .bind(retry_of_run_id)
     .bind(&context)
-    .fetch_one(&state.db)
+    .bind(pipeline.tenant_id)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
 
@@ -84,11 +119,11 @@ pub async fn start_pipeline_run(
     .bind(status)
     .bind(&error_message)
     .bind(&node_results)
-    .execute(&state.db)
+    .execute(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
 
-    if let Err(error) = record_pipeline_lineage(&state.db, pipeline.id, &nodes, &results).await {
+    if let Err(error) = record_pipeline_lineage(tx, pipeline.id, pipeline.tenant_id, &nodes, &results).await {
         tracing::warn!(pipeline_id = %pipeline.id, "pipeline lineage recording failed: {error}");
     }
 
@@ -102,14 +137,14 @@ pub async fn start_pipeline_run(
         )
         .bind(pipeline.id)
         .bind(next_run_at)
-        .execute(&state.db)
+        .execute(&mut **tx)
         .await
         .map_err(|error| error.to_string())?;
     }
 
     sqlx::query_as::<_, PipelineRun>("SELECT * FROM pipeline_runs WHERE id = $1")
         .bind(run.id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|error| error.to_string())
 }
@@ -149,19 +184,29 @@ pub async fn retry_pipeline_run(
 }
 
 pub async fn run_due_scheduled_pipelines(state: &AppState) -> Result<usize, String> {
-    let pipelines = sqlx::query_as::<_, Pipeline>(
-        r#"SELECT * FROM pipelines
-           WHERE status = 'active'
-             AND next_run_at IS NOT NULL
-             AND next_run_at <= NOW()
-           ORDER BY next_run_at ASC"#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|error| error.to_string())?;
+    let due = fetch_due_work(&state.db, "SELECT id, tenant_id FROM openfoundry_due_pipelines()")
+        .await
+        .map_err(|error| error.to_string())?;
 
     let mut triggered = 0usize;
-    for pipeline in pipelines {
+    for item in due {
+        let pipeline = {
+            let mut tx = begin_tenant_transaction(&state.db, item.tenant_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pipeline = sqlx::query_as::<_, Pipeline>("SELECT * FROM pipelines WHERE id = $1")
+                .bind(item.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| error.to_string())?;
+            tx.commit().await.map_err(|error| error.to_string())?;
+            pipeline
+        };
+
+        let Some(pipeline) = pipeline else {
+            continue;
+        };
+
         let context = json!({
             "trigger": {
                 "type": "scheduled",
@@ -232,8 +277,9 @@ fn first_failed_node(run: &PipelineRun) -> Option<String> {
 }
 
 async fn record_pipeline_lineage(
-    db: &sqlx::PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     pipeline_id: Uuid,
+    tenant_id: Uuid,
     nodes: &[PipelineNode],
     results: &[NodeResult],
 ) -> Result<(), sqlx::Error> {
@@ -253,7 +299,15 @@ async fn record_pipeline_lineage(
         };
 
         for source_dataset_id in &node.input_dataset_ids {
-            lineage::record_lineage(db, *source_dataset_id, target_dataset_id, Some(pipeline_id), Some(&node.id)).await?;
+            lineage::record_lineage(
+                tx,
+                *source_dataset_id,
+                target_dataset_id,
+                Some(pipeline_id),
+                Some(&node.id),
+                tenant_id,
+            )
+            .await?;
         }
 
         for mapping in node.column_mappings() {
@@ -265,13 +319,14 @@ async fn record_pipeline_lineage(
             };
 
             lineage::record_column_lineage(
-                db,
+                tx,
                 source_dataset_id,
                 &mapping.source_column,
                 target_dataset_id,
                 &mapping.target_column,
                 Some(pipeline_id),
                 Some(&node.id),
+                tenant_id,
             )
             .await?;
         }
@@ -283,13 +338,14 @@ async fn record_pipeline_lineage(
 
             for column in identity_columns(node) {
                 lineage::record_column_lineage(
-                    db,
+                    tx,
                     source_dataset_id,
                     &column,
                     target_dataset_id,
                     &column,
                     Some(pipeline_id),
                     Some(&node.id),
+                    tenant_id,
                 )
                 .await?;
             }

@@ -120,6 +120,9 @@ pub struct AppendAuditEventRequest {
 	pub labels: Vec<String>,
 	#[serde(default = "default_retention_days")]
 	pub retention_days: i32,
+	/// Collector-only hint. HTTP append uses JWT tenant scope and ignores this.
+	#[serde(default)]
+	pub tenant_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

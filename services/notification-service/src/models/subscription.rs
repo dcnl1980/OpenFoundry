@@ -15,6 +15,7 @@ pub struct NotificationPreference {
 	pub digest_frequency: String,
 	pub quiet_hours: Value,
 	pub updated_at: DateTime<Utc>,
+	pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]

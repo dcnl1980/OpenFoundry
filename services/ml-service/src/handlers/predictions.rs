@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::Value;
-use sqlx::{query_as, FromRow};
+use sqlx::{query_as, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -20,8 +20,11 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, deserialize_json, not_found, to_json, ServiceResult};
+use super::{
+	bad_request, db_error, deserialize_json, not_found, tenant::begin_scope, to_json, ServiceResult,
+};
 
 #[derive(Debug, FromRow)]
 struct DeploymentRow {
@@ -60,19 +63,19 @@ fn to_batch_job(row: BatchPredictionRow) -> BatchPredictionJob {
 }
 
 async fn load_deployment(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 	deployment_id: Uuid,
 ) -> Result<Option<DeploymentRow>, sqlx::Error> {
 	query_as::<_, DeploymentRow>(
 		"SELECT traffic_split FROM ml_deployments WHERE id = $1",
 	)
 	.bind(deployment_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut **tx)
 	.await
 }
 
 async fn load_versions(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 	splits: &[TrafficSplitEntry],
 ) -> Result<HashMap<Uuid, i32>, sqlx::Error> {
 	let mut versions = HashMap::new();
@@ -85,7 +88,7 @@ async fn load_versions(
 			"SELECT id, version_number FROM ml_model_versions WHERE id = $1",
 		)
 		.bind(split.model_version_id)
-		.fetch_optional(db)
+		.fetch_optional(&mut **tx)
 		.await?
 		{
 			versions.insert(row.id, row.version_number);
@@ -97,6 +100,7 @@ async fn load_versions(
 
 pub async fn realtime_predict(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(deployment_id): Path<Uuid>,
 	Json(body): Json<RealtimePredictionRequest>,
 ) -> ServiceResult<RealtimePredictionResponse> {
@@ -104,7 +108,8 @@ pub async fn realtime_predict(
 		return Err(bad_request("prediction inputs are required"));
 	}
 
-	let Some(deployment) = load_deployment(&state.db, deployment_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(deployment) = load_deployment(&mut tx, deployment_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -116,12 +121,13 @@ pub async fn realtime_predict(
 		return Err(bad_request("deployment has no traffic split configured"));
 	}
 
-	let version_map = load_versions(&state.db, &splits)
+	let version_map = load_versions(&mut tx, &splits)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	if version_map.is_empty() {
 		return Err(not_found("deployment versions not found"));
 	}
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	let outputs = body
 		.inputs
@@ -149,7 +155,9 @@ pub async fn realtime_predict(
 
 pub async fn list_batch_predictions(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListBatchPredictionsResponse> {
+	let mut tx = begin_scope(&state, &claims).await?;
 	let rows = query_as::<_, BatchPredictionRow>(
 		r#"
 		SELECT
@@ -165,9 +173,10 @@ pub async fn list_batch_predictions(
 		ORDER BY created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListBatchPredictionsResponse {
 		data: rows.into_iter().map(to_batch_job).collect(),
@@ -176,13 +185,16 @@ pub async fn list_batch_predictions(
 
 pub async fn create_batch_prediction(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateBatchPredictionRequest>,
 ) -> ServiceResult<BatchPredictionJob> {
 	if body.records.is_empty() {
 		return Err(bad_request("batch prediction records are required"));
 	}
 
-	let Some(deployment) = load_deployment(&state.db, body.deployment_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
+	let Some(deployment) = load_deployment(&mut tx, body.deployment_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -194,7 +206,7 @@ pub async fn create_batch_prediction(
 		return Err(bad_request("deployment has no traffic split configured"));
 	}
 
-	let version_map = load_versions(&state.db, &splits)
+	let version_map = load_versions(&mut tx, &splits)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	if version_map.is_empty() {
@@ -222,9 +234,10 @@ pub async fn create_batch_prediction(
 			output_destination,
 			outputs,
 			created_at,
-			completed_at
+			completed_at,
+			tenant_id
 		)
-		VALUES ($1, $2, 'completed', $3, $4, $5, $6, $7)
+		VALUES ($1, $2, 'completed', $3, $4, $5, $6, $7, $8)
 		RETURNING
 			id,
 			deployment_id,
@@ -243,9 +256,11 @@ pub async fn create_batch_prediction(
 	.bind(to_json(&outputs))
 	.bind(Utc::now())
 	.bind(Some(Utc::now()))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_batch_job(row)))
 }

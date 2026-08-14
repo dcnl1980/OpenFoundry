@@ -13,6 +13,8 @@ use crate::models::run::{PipelineRun, RetryPipelineRunRequest, TriggerPipelineRe
 use crate::AppState;
 use auth_middleware::{layer::AuthUser, tenant::TenantContext};
 
+use super::tenant::begin_scope;
+
 pub async fn trigger_run(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
@@ -20,11 +22,19 @@ pub async fn trigger_run(
     Json(body): Json<TriggerPipelineRequest>,
 ) -> impl IntoResponse {
     let tenant = TenantContext::from_claims(&claims);
-    let pipeline = match load_pipeline(&state, pipeline_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let pipeline = match load_pipeline(&mut tx, pipeline_id).await {
         Ok(Some(pipeline)) => pipeline,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     };
+    if let Err(error) = tx.commit().await {
+        tracing::error!("trigger run lookup commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     let mut context = body.context.unwrap_or_else(|| {
         json!({
@@ -61,7 +71,11 @@ pub async fn retry_run(
     Json(body): Json<RetryPipelineRunRequest>,
 ) -> impl IntoResponse {
     let tenant = TenantContext::from_claims(&claims);
-    let pipeline = match load_pipeline(&state, pipeline_id).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let pipeline = match load_pipeline(&mut tx, pipeline_id).await {
         Ok(Some(pipeline)) => pipeline,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
@@ -72,13 +86,17 @@ pub async fn retry_run(
     )
     .bind(run_id)
     .bind(pipeline_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(run)) => run,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     };
+    if let Err(error) = tx.commit().await {
+        tracing::error!("retry run lookup commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     match executor::retry_pipeline_run(
         &state,
@@ -104,12 +122,12 @@ pub async fn run_due_scheduled_pipelines(
 }
 
 async fn load_pipeline(
-    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pipeline_id: Uuid,
 ) -> Result<Option<Pipeline>, sqlx::Error> {
     sqlx::query_as::<_, Pipeline>("SELECT * FROM pipelines WHERE id = $1")
         .bind(pipeline_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut **tx)
         .await
 }
 

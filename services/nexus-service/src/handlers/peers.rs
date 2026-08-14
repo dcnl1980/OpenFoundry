@@ -1,18 +1,27 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::{audit_bridge, schema_compat},
-	handlers::{bad_request, db_error, internal_error, load_contracts, load_peer_row, load_peers, load_shares, load_sync_statuses, not_found, ServiceResult},
+	handlers::{
+		bad_request, commit_scope, db_error, internal_error, load_contracts, load_peer_row, load_peers, load_shares,
+		load_sync_statuses, not_found, open_scope, ServiceResult,
+	},
 	models::{peer::{CreatePeerRequest, PeerOrganization, UpdatePeerRequest}, sync_status::NexusOverview, ListResponse},
 	AppState,
 };
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<NexusOverview> {
-	let peers = load_peers(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let contracts = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let shares = load_shares(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let sync_statuses = load_sync_statuses(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<NexusOverview> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let peers = load_peers(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let contracts = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let shares = load_shares(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	let sync_statuses = load_sync_statuses(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	let compatibility = shares.iter().map(schema_compat::evaluate).collect::<Vec<_>>();
 	let audit_bridge = audit_bridge::summarize(&peers, &contracts, &shares, &sync_statuses);
 	let latest_sync_at = sync_statuses.iter().filter_map(|status| status.last_sync_at).max();
@@ -35,26 +44,34 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<NexusO
 	}))
 }
 
-pub async fn list_peers(State(state): State<AppState>) -> ServiceResult<ListResponse<PeerOrganization>> {
-	let items = load_peers(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_peers(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<PeerOrganization>> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let items = load_peers(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items }))
 }
 
 pub async fn create_peer(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreatePeerRequest>,
 ) -> ServiceResult<PeerOrganization> {
 	if request.slug.trim().is_empty() || request.display_name.trim().is_empty() {
 		return Err(bad_request("peer slug and display name are required"));
 	}
 
+	let mut tx = open_scope(&state, &claims).await?;
 	let id = uuid::Uuid::now_v7();
 	let now = Utc::now();
 	let shared_scopes = serde_json::to_value(&request.shared_scopes).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO nexus_peers (id, slug, display_name, region, endpoint_url, auth_mode, trust_level, public_key_fingerprint, shared_scopes, status, last_handshake_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13)",
+		"INSERT INTO nexus_peers (id, slug, display_name, region, endpoint_url, auth_mode, trust_level, public_key_fingerprint, shared_scopes, status, last_handshake_at, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14)",
 	)
 	.bind(id)
 	.bind(&request.slug)
@@ -69,14 +86,16 @@ pub async fn create_peer(
 	.bind(Option::<chrono::DateTime<chrono::Utc>>::None)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_peer_row(&state.db, id)
+	let row = load_peer_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created peer could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let peer = PeerOrganization::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(peer))
 }
@@ -84,9 +103,11 @@ pub async fn create_peer(
 pub async fn update_peer(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdatePeerRequest>,
 ) -> ServiceResult<PeerOrganization> {
-	let current = load_peer_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let current = load_peer_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("peer not found"))?;
@@ -114,14 +135,15 @@ pub async fn update_peer(
 	.bind(shared_scopes)
 	.bind(request.status.unwrap_or(current.status))
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_peer_row(&state.db, id)
+	let row = load_peer_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated peer could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let peer = PeerOrganization::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(peer))
 }
@@ -129,7 +151,9 @@ pub async fn update_peer(
 pub async fn authenticate_peer(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<PeerOrganization> {
+	let mut tx = open_scope(&state, &claims).await?;
 	let now = Utc::now();
 	let result = sqlx::query(
 		"UPDATE nexus_peers
@@ -142,7 +166,7 @@ pub async fn authenticate_peer(
 	.bind("authenticated")
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -150,10 +174,11 @@ pub async fn authenticate_peer(
 		return Err(not_found("peer not found"));
 	}
 
-	let row = load_peer_row(&state.db, id)
+	let row = load_peer_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("authenticated peer could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let peer = PeerOrganization::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(peer))
 }

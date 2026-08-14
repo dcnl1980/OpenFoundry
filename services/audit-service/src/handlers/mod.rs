@@ -1,9 +1,11 @@
 pub mod events;
 pub mod policies;
 pub mod reports;
+pub mod tenant;
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
+use sqlx::PgConnection;
 
 use crate::models::{
 	audit_event::AuditEventRow,
@@ -35,13 +37,13 @@ pub fn db_error(cause: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
 	internal_error("database operation failed")
 }
 
-pub async fn load_events(db: &sqlx::PgPool) -> Result<Vec<crate::models::audit_event::AuditEvent>, sqlx::Error> {
+pub async fn load_events(conn: &mut PgConnection) -> Result<Vec<crate::models::audit_event::AuditEvent>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, AuditEventRow>(
 		"SELECT id, sequence, previous_hash, entry_hash, source_service, channel, actor, action, resource_type, resource_id, status, severity, classification, subject_id, ip_address, location, metadata, labels, retention_until, occurred_at, ingested_at
 		 FROM audit_events
 		 ORDER BY sequence DESC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut *conn)
 	.await?;
 
 	rows.into_iter()
@@ -50,23 +52,23 @@ pub async fn load_events(db: &sqlx::PgPool) -> Result<Vec<crate::models::audit_e
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_event_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<AuditEventRow>, sqlx::Error> {
+pub async fn load_event_row(conn: &mut PgConnection, id: uuid::Uuid) -> Result<Option<AuditEventRow>, sqlx::Error> {
 	sqlx::query_as::<_, AuditEventRow>(
 		"SELECT id, sequence, previous_hash, entry_hash, source_service, channel, actor, action, resource_type, resource_id, status, severity, classification, subject_id, ip_address, location, metadata, labels, retention_until, occurred_at, ingested_at
 		 FROM audit_events WHERE id = $1",
 	)
 	.bind(id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *conn)
 	.await
 }
 
-pub async fn load_policies(db: &sqlx::PgPool) -> Result<Vec<crate::models::policy::AuditPolicy>, sqlx::Error> {
+pub async fn load_policies(conn: &mut PgConnection) -> Result<Vec<crate::models::policy::AuditPolicy>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, PolicyRow>(
 		"SELECT id, name, description, scope, classification, retention_days, legal_hold, purge_mode, active, rules, updated_by, created_at, updated_at
 		 FROM audit_policies
 		 ORDER BY updated_at DESC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut *conn)
 	.await?;
 
 	rows.into_iter()
@@ -75,23 +77,23 @@ pub async fn load_policies(db: &sqlx::PgPool) -> Result<Vec<crate::models::polic
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_policy_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<PolicyRow>, sqlx::Error> {
+pub async fn load_policy_row(conn: &mut PgConnection, id: uuid::Uuid) -> Result<Option<PolicyRow>, sqlx::Error> {
 	sqlx::query_as::<_, PolicyRow>(
 		"SELECT id, name, description, scope, classification, retention_days, legal_hold, purge_mode, active, rules, updated_by, created_at, updated_at
 		 FROM audit_policies WHERE id = $1",
 	)
 	.bind(id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *conn)
 	.await
 }
 
-pub async fn load_reports(db: &sqlx::PgPool) -> Result<Vec<crate::models::compliance_report::ComplianceReport>, sqlx::Error> {
+pub async fn load_reports(conn: &mut PgConnection) -> Result<Vec<crate::models::compliance_report::ComplianceReport>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, ComplianceReportRow>(
 		"SELECT id, standard, title, scope, window_start, window_end, generated_at, status, findings, artifact, relevant_event_count, policy_count, control_summary, expires_at
 		 FROM compliance_reports
 		 ORDER BY generated_at DESC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut *conn)
 	.await?;
 
 	rows.into_iter()

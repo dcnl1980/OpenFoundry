@@ -26,3 +26,6 @@ datafusion = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 arrow = { version = "53" }
+
+[dev-dependencies]
+tokio = { workspace = true }

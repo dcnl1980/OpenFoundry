@@ -180,6 +180,8 @@ pub struct TopologyRow {
 	pub source_stream_ids: SqlJson<Vec<Uuid>>,
 	pub sink_bindings: SqlJson<Vec<ConnectorBinding>>,
 	pub state_backend: String,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }
@@ -197,6 +199,8 @@ pub struct TopologyRunRow {
 	pub backpressure_snapshot: SqlJson<BackpressureSnapshot>,
 	pub started_at: DateTime<Utc>,
 	pub completed_at: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }

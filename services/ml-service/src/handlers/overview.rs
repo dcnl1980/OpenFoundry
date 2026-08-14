@@ -2,71 +2,78 @@ use axum::extract::State;
 use sqlx::query_scalar;
 
 use crate::{models::MlStudioOverview, AppState};
+use auth_middleware::layer::AuthUser;
 
-use super::{db_error, ServiceResult};
+use super::{db_error, tenant::begin_scope, ServiceResult};
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<MlStudioOverview> {
+pub async fn get_overview(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> ServiceResult<MlStudioOverview> {
+    let mut tx = begin_scope(&state, &claims).await?;
     let experiment_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ml_experiments")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
     let active_run_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_runs WHERE status IN ('queued', 'running', 'completed')",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
     let model_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ml_models")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
     let production_model_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_model_versions WHERE stage = 'production'",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
     let feature_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ml_features")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
     let online_feature_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_features WHERE online_enabled = TRUE",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
     let deployment_count = query_scalar::<_, i64>("SELECT COUNT(*) FROM ml_deployments")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|cause| db_error(&cause))?;
 
     let ab_test_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_deployments WHERE strategy_type = 'ab_test'",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
     let drift_alert_count = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_deployments WHERE COALESCE((drift_report->>'recommend_retraining')::boolean, FALSE)",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
 
     let queued_training_jobs = query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM ml_training_jobs WHERE status IN ('queued', 'running')",
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|cause| db_error(&cause))?;
+
+    tx.commit().await.map_err(|cause| db_error(&cause))?;
 
     Ok(axum::Json(MlStudioOverview {
         experiment_count,

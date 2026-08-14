@@ -1,7 +1,6 @@
 use auth_middleware::jwt::{self, JwtConfig};
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::domain::rbac;
@@ -27,7 +26,10 @@ impl From<auth_middleware::JwtError> for ApiKeyError {
 	}
 }
 
-pub async fn list_api_keys(pool: &PgPool, user_id: Uuid) -> Result<Vec<ApiKey>, sqlx::Error> {
+pub async fn list_api_keys(
+	conn: &mut sqlx::PgConnection,
+	user_id: Uuid,
+) -> Result<Vec<ApiKey>, sqlx::Error> {
 	sqlx::query_as::<_, ApiKey>(
 		r#"SELECT id, user_id, name, prefix, scopes, expires_at, last_used_at, revoked_at, created_at
 		   FROM api_keys
@@ -35,12 +37,12 @@ pub async fn list_api_keys(pool: &PgPool, user_id: Uuid) -> Result<Vec<ApiKey>, 
 		   ORDER BY created_at DESC"#,
 	)
 	.bind(user_id)
-	.fetch_all(pool)
+	.fetch_all(&mut *conn)
 	.await
 }
 
 pub async fn create_api_key(
-	pool: &PgPool,
+	conn: &mut sqlx::PgConnection,
 	config: &JwtConfig,
 	user: &User,
 	name: &str,
@@ -52,7 +54,7 @@ pub async fn create_api_key(
 		return Err(ApiKeyError::InvalidExpiration);
 	}
 
-	let access_bundle = rbac::get_user_access_bundle(pool, user.id)
+	let access_bundle = rbac::get_user_access_bundle(conn, user.id)
 		.await
 		.unwrap_or_default();
 	let granted_scopes = if scopes.is_empty() {
@@ -93,7 +95,7 @@ pub async fn create_api_key(
 	.bind(&prefix)
 	.bind(json!(granted_scopes))
 	.bind(expires_at)
-	.execute(pool)
+	.execute(&mut *conn)
 	.await?;
 
 	Ok(ApiKeyWithSecret {
@@ -107,13 +109,17 @@ pub async fn create_api_key(
 	})
 }
 
-pub async fn revoke_api_key(pool: &PgPool, api_key_id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn revoke_api_key(
+	conn: &mut sqlx::PgConnection,
+	api_key_id: Uuid,
+	user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
 	let result = sqlx::query(
 		"UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
 	)
 	.bind(api_key_id)
 	.bind(user_id)
-	.execute(pool)
+	.execute(&mut *conn)
 	.await?;
 
 	Ok(result.rows_affected() > 0)

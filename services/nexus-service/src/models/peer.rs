@@ -36,6 +36,8 @@ pub struct PeerRow {
 	pub last_handshake_at: Option<DateTime<Utc>>,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: uuid::Uuid,
 }
 
 impl TryFrom<PeerRow> for PeerOrganization {

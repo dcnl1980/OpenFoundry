@@ -47,6 +47,7 @@ pub struct Property {
     pub unique_constraint: bool,
     pub default_value: Option<serde_json::Value>,
     pub validation_rules: Option<serde_json::Value>,
+    pub tenant_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

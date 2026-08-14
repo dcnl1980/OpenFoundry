@@ -24,3 +24,6 @@ chrono = { workspace = true }
 config = { workspace = true }
 vector-store = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

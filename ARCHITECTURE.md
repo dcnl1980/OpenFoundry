@@ -43,9 +43,30 @@ Browser (apps/web)
 
 ## Tenant boundary
 
-A tenant is an organization scope taken from the JWT (`org_id`, else the subject). `auth-middleware::TenantContext` also carries tier and quota policy (query limit, pipeline workers, request body size, requests per minute).
+A tenant is an organization scope taken from the JWT (`org_id`, else the subject). `Claims::tenant_scope_id()` is that UUID. `auth-middleware::TenantContext` also carries tier and quota policy (query limit, pipeline workers, request body size, requests per minute). Admin roles do **not** bypass the tenant partition.
 
 Services must not trust the client for that scope. The only trusted copy is the one the gateway writes after it decodes the bearer token.
+
+### Database isolation
+
+The gateway hop is not enough. Every tenant-owned row carries `tenant_id UUID NOT NULL` with composite uniqueness such as `UNIQUE (tenant_id, name)`. Handlers open a transaction and run `SET LOCAL openfoundry.tenant_id = …` via `begin_tenant_transaction`. PostgreSQL RLS policies then allow only matching rows:
+
+```
+JWT → Claims::tenant_scope_id()
+    → SET LOCAL openfoundry.tenant_id
+    → RLS USING (tenant_id = openfoundry_current_tenant())
+    → customer_A rows only
+```
+
+The application database role must **not** be `SUPERUSER` or `BYPASSRLS`. Superusers silently skip RLS even when `FORCE ROW LEVEL SECURITY` is on. Cross-tenant reads, writes, search, and guessed UUIDs must be indistinguishable 404/empty results.
+
+This data-plane boundary is enforced on tenant-owned tables in ontology, query, dataset, pipeline, workflow, notebook, ML, fusion, streaming, geospatial, app-builder (including `app_templates`), AI (providers, tools, conversations, knowledge, agents, prompts, cache), data-connector, report, marketplace, code-repo, nexus, notification, auth, and audit.
+
+Auth login/register/SSO public entry points look up a user or provider through `SECURITY DEFINER` helpers, then reopen a tenant transaction. Email and SSO slugs stay globally unique so those lookups stay unambiguous. System roles (`admin`, `editor`, `viewer`) remain readable inside every tenant.
+
+Services migrate with `MIGRATION_DATABASE_URL` (owner/superuser) and serve traffic through `DATABASE_URL` as `openfoundry_app`. `connect_runtime_pool` refuses `SUPERUSER` and `BYPASSRLS` roles because those skip `FORCE ROW LEVEL SECURITY`.
+
+Scheduled pipeline and workflow workers discover due rows through `SECURITY DEFINER` functions (`openfoundry_due_pipelines`, `openfoundry_due_workflows`), then reopen a normal tenant transaction per row. The runtime role must still be `openfoundry_app` (`NOSUPERUSER NOBYPASSRLS`); the owner/superuser role bypasses RLS.
 
 ## Auth trust chain
 

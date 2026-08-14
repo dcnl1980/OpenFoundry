@@ -13,6 +13,7 @@ pub struct LinkType {
     pub target_type_id: Uuid,
     pub cardinality: String,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -6,18 +6,23 @@ use axum::{
 };
 use serde_json::json;
 use uuid::Uuid;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
-	handlers::send::unread_count,
+	handlers::{send::unread_count, tenant::begin_scope},
 	models::notification::{ListNotificationsQuery, NotificationEvent, NotificationRecord},
 	AppState,
 };
 
 pub async fn list_notifications(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Query(params): Query<ListNotificationsQuery>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
 	let notifications = sqlx::query_as::<_, NotificationRecord>(
@@ -30,15 +35,22 @@ pub async fn list_notifications(
 	.bind(claims.sub)
 	.bind(&params.status)
 	.bind(limit)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await;
 
 	match notifications {
-		Ok(data) => Json(json!({
-			"data": data,
-			"unread_count": unread_count(&state, Some(claims.sub)).await.unwrap_or(0),
-		}))
-		.into_response(),
+		Ok(data) => {
+			let unread = unread_count(&mut tx, Some(claims.sub)).await.unwrap_or(0);
+			if let Err(error) = tx.commit().await {
+				tracing::error!("list notifications commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(json!({
+				"data": data,
+				"unread_count": unread,
+			}))
+			.into_response()
+		}
 		Err(error) => {
 			tracing::error!("list notifications failed: {error}");
 			StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -49,8 +61,12 @@ pub async fn list_notifications(
 pub async fn mark_read(
 	State(state): State<AppState>,
 	Path(notification_id): Path<Uuid>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let notification = sqlx::query_as::<_, NotificationRecord>(
 		r#"UPDATE notifications
 		   SET status = 'read', read_at = NOW()
@@ -59,12 +75,16 @@ pub async fn mark_read(
 	)
 	.bind(notification_id)
 	.bind(claims.sub)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *tx)
 	.await;
 
 	match notification {
 		Ok(Some(notification)) => {
-			let unread = unread_count(&state, Some(claims.sub)).await.unwrap_or(0);
+			let unread = unread_count(&mut tx, Some(claims.sub)).await.unwrap_or(0);
+			if let Err(error) = tx.commit().await {
+				tracing::error!("mark notification read commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
 			let _ = state.notification_bus.send(NotificationEvent {
 				kind: "notification.read".to_string(),
 				user_id: Some(claims.sub),
@@ -83,18 +103,26 @@ pub async fn mark_read(
 
 pub async fn mark_all_read(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	match sqlx::query(
 		r#"UPDATE notifications
 		   SET status = 'read', read_at = NOW()
 		   WHERE status = 'unread' AND (user_id = $1 OR user_id IS NULL)"#,
 	)
 	.bind(claims.sub)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	{
 		Ok(_) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("mark all notifications read commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
 			let _ = state.notification_bus.send(NotificationEvent {
 				kind: "notification.read_all".to_string(),
 				user_id: Some(claims.sub),

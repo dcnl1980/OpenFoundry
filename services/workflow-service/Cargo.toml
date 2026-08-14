@@ -25,3 +25,6 @@ config = { workspace = true }
 reqwest = { workspace = true }
 cron = "0.12"
 
+[dev-dependencies]
+tokio = { workspace = true }
+

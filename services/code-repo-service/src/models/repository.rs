@@ -165,6 +165,8 @@ pub struct RepositoryRow {
 	pub settings: Value,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<RepositoryRow> for RepositoryDefinition {

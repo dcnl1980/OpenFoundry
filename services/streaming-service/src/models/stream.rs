@@ -103,6 +103,8 @@ pub struct StreamRow {
 	pub schema: SqlJson<StreamSchema>,
 	pub source_binding: SqlJson<ConnectorBinding>,
 	pub retention_hours: i32,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }

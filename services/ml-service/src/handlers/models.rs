@@ -4,7 +4,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::{json, Value};
-use sqlx::{query_as, query_scalar, FromRow, PgPool};
+use sqlx::{query_as, query_scalar, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -17,8 +17,11 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, deserialize_json, not_found, to_json, ServiceResult};
+use super::{
+	bad_request, db_error, deserialize_json, not_found, tenant::begin_scope, to_json, ServiceResult,
+};
 
 #[derive(Debug, FromRow)]
 struct ModelRow {
@@ -88,31 +91,34 @@ fn to_version(row: ModelVersionRow) -> ModelVersion {
 	}
 }
 
-async fn refresh_model_rollup(db: &PgPool, model_id: Uuid) -> Result<(), sqlx::Error> {
+async fn refresh_model_rollup(
+	tx: &mut Transaction<'_, Postgres>,
+	model_id: Uuid,
+) -> Result<(), sqlx::Error> {
 	let latest_version_number = query_scalar::<_, Option<i32>>(
 		"SELECT MAX(version_number) FROM ml_model_versions WHERE model_id = $1",
 	)
 	.bind(model_id)
-	.fetch_one(db)
+	.fetch_one(&mut **tx)
 	.await?;
 
 	let production_versions = query_scalar::<_, i64>(
 		"SELECT COUNT(*) FROM ml_model_versions WHERE model_id = $1 AND stage = 'production'",
 	)
 	.bind(model_id)
-	.fetch_one(db)
+	.fetch_one(&mut **tx)
 	.await?;
 	let staging_versions = query_scalar::<_, i64>(
 		"SELECT COUNT(*) FROM ml_model_versions WHERE model_id = $1 AND stage = 'staging'",
 	)
 	.bind(model_id)
-	.fetch_one(db)
+	.fetch_one(&mut **tx)
 	.await?;
 	let candidate_versions = query_scalar::<_, i64>(
 		"SELECT COUNT(*) FROM ml_model_versions WHERE model_id = $1 AND stage = 'candidate'",
 	)
 	.bind(model_id)
-	.fetch_one(db)
+	.fetch_one(&mut **tx)
 	.await?;
 
 	let current_stage = if production_versions > 0 {
@@ -131,13 +137,16 @@ async fn refresh_model_rollup(db: &PgPool, model_id: Uuid) -> Result<(), sqlx::E
 	.bind(model_id)
 	.bind(latest_version_number)
 	.bind(current_stage)
-	.execute(db)
+	.execute(&mut **tx)
 	.await?;
 
 	Ok(())
 }
 
-async fn load_model(db: &PgPool, model_id: Uuid) -> Result<Option<ModelRow>, sqlx::Error> {
+async fn load_model(
+	tx: &mut Transaction<'_, Postgres>,
+	model_id: Uuid,
+) -> Result<Option<ModelRow>, sqlx::Error> {
 	query_as::<_, ModelRow>(
 		r#"
 		SELECT
@@ -158,11 +167,15 @@ async fn load_model(db: &PgPool, model_id: Uuid) -> Result<Option<ModelRow>, sql
 		"#,
 	)
 	.bind(model_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut **tx)
 	.await
 }
 
-pub async fn list_models(State(state): State<AppState>) -> ServiceResult<ListModelsResponse> {
+pub async fn list_models(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListModelsResponse> {
+	let mut tx = begin_scope(&state, &claims).await?;
 	let rows = query_as::<_, ModelRow>(
 		r#"
 		SELECT
@@ -182,9 +195,10 @@ pub async fn list_models(State(state): State<AppState>) -> ServiceResult<ListMod
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListModelsResponse {
 		data: rows.into_iter().map(to_model).collect(),
@@ -193,12 +207,15 @@ pub async fn list_models(State(state): State<AppState>) -> ServiceResult<ListMod
 
 pub async fn create_model(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateModelRequest>,
 ) -> ServiceResult<RegisteredModel> {
 	if body.name.trim().is_empty() {
 		return Err(bad_request("model name is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
 	let row = query_as::<_, ModelRow>(
 		r#"
 		INSERT INTO ml_models (
@@ -209,9 +226,10 @@ pub async fn create_model(
 			status,
 			tags,
 			current_stage,
-			latest_version_number
+			latest_version_number,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, 'none', NULL)
+		VALUES ($1, $2, $3, $4, $5, $6, 'none', NULL, $7)
 		RETURNING
 			id,
 			name,
@@ -233,19 +251,23 @@ pub async fn create_model(
 	.bind(body.problem_type)
 	.bind(body.status.unwrap_or_else(|| "active".to_string()))
 	.bind(to_json(&body.tags))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_model(row)))
 }
 
 pub async fn update_model(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(model_id): Path<Uuid>,
 	Json(body): Json<UpdateModelRequest>,
 ) -> ServiceResult<RegisteredModel> {
-	let Some(current) = load_model(&state.db, model_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(current) = load_model(&mut tx, model_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -286,20 +308,23 @@ pub async fn update_model(
 	.bind(body.problem_type.unwrap_or(current.problem_type))
 	.bind(body.status.unwrap_or(current.status))
 	.bind(to_json(&tags))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_model(row)))
 }
 
 pub async fn list_model_versions(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(model_id): Path<Uuid>,
 ) -> ServiceResult<ListModelVersionsResponse> {
+	let mut tx = begin_scope(&state, &claims).await?;
 	let exists = query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ml_models WHERE id = $1)")
 		.bind(model_id)
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 
@@ -329,9 +354,10 @@ pub async fn list_model_versions(
 		"#,
 	)
 	.bind(model_id)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListModelVersionsResponse {
 		data: rows.into_iter().map(to_version).collect(),
@@ -340,12 +366,15 @@ pub async fn list_model_versions(
 
 pub async fn create_model_version(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(model_id): Path<Uuid>,
 	Json(body): Json<CreateModelVersionRequest>,
 ) -> ServiceResult<ModelVersion> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
 	let exists = query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM ml_models WHERE id = $1)")
 		.bind(model_id)
-		.fetch_one(&state.db)
+		.fetch_one(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 
@@ -357,7 +386,7 @@ pub async fn create_model_version(
 		"SELECT COALESCE(MAX(version_number), 0) + 1 FROM ml_model_versions WHERE model_id = $1",
 	)
 	.bind(model_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -380,9 +409,10 @@ pub async fn create_model_version(
 			metrics,
 			artifact_uri,
 			schema,
-			promoted_at
+			promoted_at,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING
 			id,
 			model_id,
@@ -415,19 +445,22 @@ pub async fn create_model_version(
 	} else {
 		None
 	})
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	refresh_model_rollup(&state.db, model_id)
+	refresh_model_rollup(&mut tx, model_id)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_version(row)))
 }
 
 pub async fn transition_model_version(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(version_id): Path<Uuid>,
 	Json(body): Json<TransitionModelVersionRequest>,
 ) -> ServiceResult<ModelVersion> {
@@ -435,6 +468,7 @@ pub async fn transition_model_version(
 		return Err(bad_request("target stage is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims).await?;
 	let Some(current) = query_as::<_, ModelVersionRow>(
 		r#"
 		SELECT
@@ -456,7 +490,7 @@ pub async fn transition_model_version(
 		"#,
 	)
 	.bind(version_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?
 	else {
@@ -469,7 +503,7 @@ pub async fn transition_model_version(
 		)
 		.bind(current.model_id)
 		.bind(version_id)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	}
@@ -500,13 +534,14 @@ pub async fn transition_model_version(
 	.bind(version_id)
 	.bind(body.stage.as_str())
 	.bind(Some(Utc::now()))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	refresh_model_rollup(&state.db, current.model_id)
+	refresh_model_rollup(&mut tx, current.model_id)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_version(row)))
 }

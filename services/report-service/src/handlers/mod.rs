@@ -2,6 +2,7 @@ pub mod crud;
 pub mod download;
 pub mod generate;
 pub mod schedule;
+pub mod tenant;
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
@@ -48,7 +49,7 @@ pub fn db_error(cause: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 pub async fn load_report_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	id: uuid::Uuid,
 ) -> Result<Option<ReportRow>, sqlx::Error> {
 	sqlx::query_as::<_, ReportRow>(
@@ -57,17 +58,17 @@ pub async fn load_report_row(
 		 WHERE id = $1",
 	)
 	.bind(id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
-pub async fn load_all_reports(db: &sqlx::PgPool) -> Result<Vec<crate::models::report::ReportDefinition>, sqlx::Error> {
+pub async fn load_all_reports(db: &mut sqlx::PgConnection) -> Result<Vec<crate::models::report::ReportDefinition>, sqlx::Error> {
 	let rows = sqlx::query_as::<_, ReportRow>(
 		"SELECT id, name, description, owner, generator_kind, dataset_name, template, schedule, recipients, tags, parameters, active, last_generated_at, created_at, updated_at
 		 FROM report_definitions
 		 ORDER BY updated_at DESC",
 	)
-	.fetch_all(db)
+	.fetch_all(&mut *db)
 	.await?;
 
 	rows.into_iter()
@@ -77,7 +78,7 @@ pub async fn load_all_reports(db: &sqlx::PgPool) -> Result<Vec<crate::models::re
 }
 
 pub async fn load_execution_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	id: uuid::Uuid,
 ) -> Result<Option<ReportExecutionRow>, sqlx::Error> {
 	sqlx::query_as::<_, ReportExecutionRow>(
@@ -87,12 +88,12 @@ pub async fn load_execution_row(
 		 WHERE e.id = $1",
 	)
 	.bind(id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
 pub async fn load_execution_history(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	report_id: Option<uuid::Uuid>,
 	limit: i64,
 ) -> Result<Vec<crate::models::snapshot::ReportExecution>, sqlx::Error> {
@@ -107,7 +108,7 @@ pub async fn load_execution_history(
 		)
 		.bind(report_id)
 		.bind(limit)
-		.fetch_all(db)
+		.fetch_all(&mut *db)
 		.await?
 	} else {
 		sqlx::query_as::<_, ReportExecutionRow>(
@@ -118,7 +119,7 @@ pub async fn load_execution_history(
 			 LIMIT $1",
 		)
 		.bind(limit)
-		.fetch_all(db)
+		.fetch_all(&mut *db)
 		.await?
 	};
 

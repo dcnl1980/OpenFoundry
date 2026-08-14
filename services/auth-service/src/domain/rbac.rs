@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::role::Role;
@@ -10,34 +9,48 @@ pub struct AccessBundle {
     pub permissions: Vec<String>,
 }
 
-pub async fn assign_role(pool: &PgPool, user_id: Uuid, role_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn assign_role(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    role_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(user_id)
     .bind(role_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-pub async fn remove_role(pool: &PgPool, user_id: Uuid, role_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn remove_role(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    role_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2")
         .bind(user_id)
         .bind(role_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
-pub async fn get_role_by_name(pool: &PgPool, name: &str) -> Result<Option<Role>, sqlx::Error> {
+pub async fn get_role_by_name(
+    conn: &mut sqlx::PgConnection,
+    name: &str,
+) -> Result<Option<Role>, sqlx::Error> {
     sqlx::query_as::<_, Role>("SELECT id, name, description, created_at FROM roles WHERE name = $1")
         .bind(name)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
 }
 
-pub async fn get_user_access_bundle(pool: &PgPool, user_id: Uuid) -> Result<AccessBundle, sqlx::Error> {
+pub async fn get_user_access_bundle(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+) -> Result<AccessBundle, sqlx::Error> {
     let roles = sqlx::query_scalar::<_, String>(
         r#"SELECT DISTINCT name FROM (
                SELECT r.name AS name
@@ -54,7 +67,7 @@ pub async fn get_user_access_bundle(pool: &PgPool, user_id: Uuid) -> Result<Acce
            ORDER BY name"#,
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let groups = sqlx::query_scalar::<_, String>(
@@ -65,7 +78,7 @@ pub async fn get_user_access_bundle(pool: &PgPool, user_id: Uuid) -> Result<Acce
            ORDER BY g.name"#,
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let permissions = sqlx::query_scalar::<_, String>(
@@ -85,7 +98,7 @@ pub async fn get_user_access_bundle(pool: &PgPool, user_id: Uuid) -> Result<Acce
            ORDER BY permission_key"#,
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     Ok(AccessBundle {

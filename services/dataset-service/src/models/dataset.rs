@@ -13,6 +13,7 @@ pub struct Dataset {
     pub size_bytes: i64,
     pub row_count: i64,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub tags: Vec<String>,
     pub current_version: i32,
     pub active_branch: String,

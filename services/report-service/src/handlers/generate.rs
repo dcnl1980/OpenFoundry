@@ -1,9 +1,10 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::{data_fetcher, distribution, generators},
-	handlers::{db_error, internal_error, load_execution_history, load_execution_row, load_report_row, not_found, ServiceResult},
+	handlers::{db_error, internal_error, load_execution_history, load_execution_row, load_report_row, not_found, tenant::begin_scope, ServiceResult},
 	models::{
 		report::ReportDefinition,
 		snapshot::{ReportCatalog, ReportExecution},
@@ -22,8 +23,12 @@ pub async fn get_catalog() -> ServiceResult<ReportCatalog> {
 pub async fn generate_report(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ReportExecution> {
-	let report_row = load_report_row(&state.db, id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let report_row = load_report_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("report not found"))?;
@@ -37,10 +42,11 @@ pub async fn generate_report(
 	let artifact = serde_json::to_value(&generated.artifact).map_err(|cause| internal_error(cause.to_string()))?;
 	let distribution_rows = serde_json::to_value(&distributions).map_err(|cause| internal_error(cause.to_string()))?;
 	let metrics = serde_json::to_value(&generated.metrics).map_err(|cause| internal_error(cause.to_string()))?;
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO report_executions (id, report_id, status, generator_kind, triggered_by, generated_at, completed_at, preview, artifact, distributions, metrics)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb)",
+		"INSERT INTO report_executions (id, report_id, status, generator_kind, triggered_by, generated_at, completed_at, preview, artifact, distributions, metrics, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12)",
 	)
 	.bind(execution_id)
 	.bind(report.id)
@@ -53,7 +59,8 @@ pub async fn generate_report(
 	.bind(artifact)
 	.bind(distribution_rows)
 	.bind(metrics)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -63,14 +70,18 @@ pub async fn generate_report(
 	.bind(report.id)
 	.bind(generated_at)
 	.bind(generated_at)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_execution_row(&state.db, execution_id)
+	let row = load_execution_row(&mut tx, execution_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("generated execution could not be reloaded"))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("generate report commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 	let execution = ReportExecution::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(execution))
 }
@@ -78,11 +89,19 @@ pub async fn generate_report(
 pub async fn get_execution(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ReportExecution> {
-	let row = load_execution_row(&state.db, id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let row = load_execution_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("report execution not found"))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("get execution commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 	let execution = ReportExecution::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(execution))
 }
@@ -90,9 +109,17 @@ pub async fn get_execution(
 pub async fn list_history(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListResponse<ReportExecution>> {
-	let history = load_execution_history(&state.db, Some(id), 12)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let history = load_execution_history(&mut tx, Some(id), 12)
 		.await
 		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list history commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 	Ok(Json(ListResponse { items: history }))
 }

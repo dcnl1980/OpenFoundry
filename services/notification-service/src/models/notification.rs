@@ -17,6 +17,7 @@ pub struct NotificationRecord {
 	pub metadata: Value,
 	pub created_at: DateTime<Utc>,
 	pub read_at: Option<DateTime<Utc>>,
+	pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub struct NotificationDelivery {
 	pub status: String,
 	pub response: Option<String>,
 	pub created_at: DateTime<Utc>,
+	pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +42,7 @@ pub struct NotificationEvent {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SendNotificationRequest {
 	pub user_id: Option<Uuid>,
+	pub tenant_id: Option<Uuid>,
 	pub title: String,
 	pub body: String,
 	pub severity: Option<String>,

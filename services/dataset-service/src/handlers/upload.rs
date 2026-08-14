@@ -10,17 +10,24 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::domain::quality::profiler;
 use crate::models::dataset::Dataset;
+use auth_middleware::layer::AuthUser;
+
+use super::tenant::begin_scope;
 
 /// POST /api/v1/datasets/:id/upload
 pub async fn upload_data(
     State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(dataset_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    // Verify dataset exists
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let ds = match sqlx::query_as::<_, Dataset>("SELECT * FROM datasets WHERE id = $1")
         .bind(dataset_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
     {
         Ok(Some(d)) => d,
@@ -31,7 +38,6 @@ pub async fn upload_data(
         }
     };
 
-    // Read file from multipart
     let mut file_data = BytesMut::new();
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("file") {
@@ -39,14 +45,22 @@ pub async fn upload_data(
                 Ok(data) => file_data.extend_from_slice(&data),
                 Err(e) => {
                     tracing::error!("failed to read upload: {e}");
-                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "failed to read file" }))).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "failed to read file" })),
+                    )
+                        .into_response();
                 }
             }
         }
     }
 
     if file_data.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "no file provided" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no file provided" })),
+        )
+            .into_response();
     }
 
     let data = file_data.freeze();
@@ -55,22 +69,24 @@ pub async fn upload_data(
         "SELECT MAX(version) FROM dataset_versions WHERE dataset_id = $1",
     )
     .bind(dataset_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(None)
     .unwrap_or(ds.current_version.saturating_sub(1));
     let new_version = latest_version + 1;
     let version_path = format!("{}/v{new_version}", ds.storage_path);
 
-    // Upload to storage
     if let Err(e) = state.storage.put(&version_path, data.clone()).await {
         tracing::error!("storage upload failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "storage upload failed" }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "storage upload failed" })),
+        )
+            .into_response();
     }
 
-    // Create version record
     let version_id = Uuid::now_v7();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         r#"INSERT INTO dataset_versions (id, dataset_id, version, size_bytes, storage_path)
            VALUES ($1, $2, $3, $4, $5)"#,
     )
@@ -79,20 +95,27 @@ pub async fn upload_data(
     .bind(new_version)
     .bind(size)
     .bind(&version_path)
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("upload version insert failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
-    // Update dataset
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE datasets SET current_version = $2, size_bytes = $3, updated_at = NOW() WHERE id = $1",
     )
     .bind(dataset_id)
     .bind(new_version)
     .bind(size)
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("upload dataset update failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         r#"UPDATE dataset_branches
            SET version = $3,
                updated_at = NOW()
@@ -101,26 +124,41 @@ pub async fn upload_data(
     .bind(dataset_id)
     .bind(&ds.active_branch)
     .bind(new_version)
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("upload branch update failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     let refreshed_dataset = sqlx::query_as::<_, Dataset>("SELECT * FROM datasets WHERE id = $1")
         .bind(dataset_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
         .ok()
         .flatten();
 
+    if let Err(error) = tx.commit().await {
+        tracing::error!("upload commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     if let Some(dataset) = refreshed_dataset {
-        if let Err(error) = profiler::refresh_dataset_quality(&state, &dataset, Some(data.clone())).await {
+        if let Err(error) =
+            profiler::refresh_dataset_quality(&state, &dataset, Some(data.clone())).await
+        {
             tracing::warn!(dataset_id = %dataset_id, "quality refresh failed after upload: {error}");
         }
     }
 
     tracing::info!(dataset_id = %dataset_id, version = new_version, "data uploaded");
-    (StatusCode::OK, Json(serde_json::json!({
-        "dataset_id": dataset_id,
-        "version": new_version,
-        "size_bytes": size,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "dataset_id": dataset_id,
+            "version": new_version,
+            "size_bytes": size,
+        })),
+    )
+        .into_response()
 }

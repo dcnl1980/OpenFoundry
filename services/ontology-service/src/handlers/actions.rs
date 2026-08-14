@@ -27,7 +27,8 @@ use crate::{
 	AppState,
 };
 
-use super::{links::LinkInstance, objects::ObjectInstance};
+use super::{links::LinkInstance, objects::ObjectInstance, tenant::begin_scope};
+use sqlx::PgConnection;
 
 #[derive(Debug, Deserialize)]
 struct UpdateObjectActionConfig {
@@ -115,7 +116,7 @@ fn db_error(message: impl Into<String>) -> Response {
 }
 
 async fn load_action_row(
-	state: &AppState,
+	db: &mut PgConnection,
 	action_id: Uuid,
 ) -> Result<Option<ActionTypeRow>, sqlx::Error> {
 	sqlx::query_as::<_, ActionTypeRow>(
@@ -124,36 +125,36 @@ async fn load_action_row(
 		   FROM action_types WHERE id = $1"#,
 	)
 	.bind(action_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
 async fn load_object_instance(
-	state: &AppState,
+	db: &mut PgConnection,
 	object_id: Uuid,
 ) -> Result<Option<ObjectInstance>, sqlx::Error> {
 	sqlx::query_as::<_, ObjectInstance>("SELECT * FROM object_instances WHERE id = $1")
 		.bind(object_id)
-		.fetch_optional(&state.db)
+		.fetch_optional(&mut *db)
 		.await
 }
 
 async fn load_object_properties(
-	state: &AppState,
+	db: &mut PgConnection,
 	object_type_id: Uuid,
 ) -> Result<Vec<Property>, sqlx::Error> {
 	sqlx::query_as::<_, Property>(
 		r#"SELECT * FROM properties WHERE object_type_id = $1 ORDER BY created_at ASC"#,
 	)
 	.bind(object_type_id)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *db)
 	.await
 }
 
-async fn ensure_object_type_exists(state: &AppState, object_type_id: Uuid) -> Result<bool, sqlx::Error> {
+async fn ensure_object_type_exists(db: &mut PgConnection, object_type_id: Uuid) -> Result<bool, sqlx::Error> {
 	sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM object_types WHERE id = $1)")
 		.bind(object_type_id)
-		.fetch_one(&state.db)
+		.fetch_one(&mut *db)
 		.await
 }
 
@@ -312,14 +313,14 @@ async fn invoke_http_action(
 }
 
 async fn apply_object_patch(
-	state: &AppState,
+	db: &mut PgConnection,
 	target: &ObjectInstance,
 	patch_value: &Value,
 ) -> Result<ObjectInstance, String> {
 	let patch = patch_value
 		.as_object()
 		.ok_or_else(|| "object_patch must be a JSON object".to_string())?;
-	let properties = load_object_properties(state, target.object_type_id)
+	let properties = load_object_properties(db, target.object_type_id)
 		.await
 		.map_err(|e| format!("failed to load property definitions: {e}"))?;
 	let property_types = properties
@@ -345,24 +346,25 @@ async fn apply_object_patch(
 	)
 	.bind(target.id)
 	.bind(Value::Object(next_properties))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *db)
 	.await
 	.map_err(|e| format!("failed to apply object patch: {e}"))
 }
 
 async fn create_link_from_instruction(
-	state: &AppState,
+	db: &mut PgConnection,
 	actor_id: Uuid,
+	tenant_id: Uuid,
 	target: &ObjectInstance,
 	instruction: &FunctionLinkInstruction,
 ) -> Result<LinkInstance, String> {
-	let counterpart = load_object_instance(state, instruction.target_object_id)
+	let counterpart = load_object_instance(db, instruction.target_object_id)
 		.await
 		.map_err(|e| format!("failed to load linked object: {e}"))?
 		.ok_or_else(|| "linked object was not found".to_string())?;
 	let link_type = sqlx::query_as::<_, LinkType>("SELECT * FROM link_types WHERE id = $1")
 		.bind(instruction.link_type_id)
-		.fetch_optional(&state.db)
+		.fetch_optional(&mut *db)
 		.await
 		.map_err(|e| format!("failed to load link type: {e}"))?
 		.ok_or_else(|| "configured link type was not found".to_string())?;
@@ -387,8 +389,8 @@ async fn create_link_from_instruction(
 	}
 
 	sqlx::query_as::<_, LinkInstance>(
-		r#"INSERT INTO link_instances (id, link_type_id, source_object_id, target_object_id, properties, created_by)
-		   VALUES ($1, $2, $3, $4, $5, $6)
+		r#"INSERT INTO link_instances (id, link_type_id, source_object_id, target_object_id, properties, created_by, tenant_id)
+		   VALUES ($1, $2, $3, $4, $5, $6, $7)
 		   RETURNING *"#,
 	)
 	.bind(Uuid::now_v7())
@@ -397,7 +399,8 @@ async fn create_link_from_instruction(
 	.bind(target_object_id)
 	.bind(instruction.properties.clone())
 	.bind(actor_id)
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *db)
 	.await
 	.map_err(|e| format!("failed to create link from function response: {e}"))
 }
@@ -435,13 +438,13 @@ fn derive_function_effects(
 }
 
 async fn validate_action_definition(
-	state: &AppState,
+	db: &mut PgConnection,
 	object_type_id: Uuid,
 	operation_kind_raw: &str,
 	input_schema: &[ActionInputField],
 	config: &Value,
 ) -> Result<ActionOperationKind, String> {
-	if !ensure_object_type_exists(state, object_type_id)
+	if !ensure_object_type_exists(db, object_type_id)
 		.await
 		.map_err(|e| format!("failed to validate object type: {e}"))?
 	{
@@ -505,7 +508,7 @@ async fn validate_action_definition(
 			}
 			let link_type = sqlx::query_as::<_, LinkType>("SELECT * FROM link_types WHERE id = $1")
 				.bind(cfg.link_type_id)
-				.fetch_optional(&state.db)
+				.fetch_optional(&mut *db)
 				.await
 				.map_err(|e| format!("failed to validate link type: {e}"))?
 				.ok_or_else(|| "referenced link type does not exist".to_string())?;
@@ -532,7 +535,8 @@ async fn validate_action_definition(
 }
 
 async fn plan_action(
-	state: &AppState,
+	_state: &AppState,
+	db: &mut PgConnection,
 	action: &ActionType,
 	request: &ValidateActionRequest,
 ) -> Result<ActionPlan, Vec<String>> {
@@ -547,7 +551,7 @@ async fn plan_action(
 			let target_object_id = request
 				.target_object_id
 				.ok_or_else(|| vec!["target_object_id is required for update_object actions".to_string()])?;
-			let target = load_object_instance(state, target_object_id)
+			let target = load_object_instance(db, target_object_id)
 				.await
 				.map_err(|e| vec![format!("failed to load target object: {e}")])?
 				.ok_or_else(|| vec!["target object was not found".to_string()])?;
@@ -555,7 +559,7 @@ async fn plan_action(
 
 			let cfg: UpdateObjectActionConfig = serde_json::from_value(action.config.clone())
 				.map_err(|e| vec![format!("invalid action config: {e}")])?;
-			let properties = load_object_properties(state, action.object_type_id)
+			let properties = load_object_properties(db, action.object_type_id)
 				.await
 				.map_err(|e| vec![format!("failed to load property definitions: {e}")])?;
 			let property_types = properties
@@ -600,7 +604,7 @@ async fn plan_action(
 			let target_object_id = request
 				.target_object_id
 				.ok_or_else(|| vec!["target_object_id is required for create_link actions".to_string()])?;
-			let target = load_object_instance(state, target_object_id)
+			let target = load_object_instance(db, target_object_id)
 				.await
 				.map_err(|e| vec![format!("failed to load target object: {e}")])?
 				.ok_or_else(|| vec!["target object was not found".to_string()])?;
@@ -610,13 +614,13 @@ async fn plan_action(
 				.map_err(|e| vec![format!("invalid action config: {e}")])?;
 			let counterpart_id = resolve_uuid_parameter(&parameters, &cfg.target_input_name)
 				.map_err(|e| vec![e])?;
-			let counterpart = load_object_instance(state, counterpart_id)
+			let counterpart = load_object_instance(db, counterpart_id)
 				.await
 				.map_err(|e| vec![format!("failed to load linked object: {e}")])?
 				.ok_or_else(|| vec!["linked object was not found".to_string()])?;
 			let link_type = sqlx::query_as::<_, LinkType>("SELECT * FROM link_types WHERE id = $1")
 				.bind(cfg.link_type_id)
-				.fetch_optional(&state.db)
+				.fetch_optional(&mut *db)
 				.await
 				.map_err(|e| vec![format!("failed to load link type: {e}")])?
 				.ok_or_else(|| vec!["configured link type was not found".to_string()])?;
@@ -648,7 +652,7 @@ async fn plan_action(
 			let target_object_id = request
 				.target_object_id
 				.ok_or_else(|| vec!["target_object_id is required for delete_object actions".to_string()])?;
-			let target = load_object_instance(state, target_object_id)
+			let target = load_object_instance(db, target_object_id)
 				.await
 				.map_err(|e| vec![format!("failed to load target object: {e}")])?
 				.ok_or_else(|| vec!["target object was not found".to_string()])?;
@@ -659,7 +663,7 @@ async fn plan_action(
 		ActionOperationKind::InvokeFunction | ActionOperationKind::InvokeWebhook => {
 			let invocation = validate_http_invocation_config(&action.config).map_err(|e| vec![e])?;
 			let target = if let Some(target_object_id) = request.target_object_id {
-				let target = load_object_instance(state, target_object_id)
+				let target = load_object_instance(db, target_object_id)
 					.await
 					.map_err(|e| vec![format!("failed to load target object: {e}")])?
 					.ok_or_else(|| vec!["target object was not found".to_string()])?;
@@ -754,13 +758,19 @@ pub async fn create_action_type(
 		return invalid_action("action type name is required");
 	}
 
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
+
 	let display_name = body.display_name.unwrap_or_else(|| body.name.clone());
 	let description = body.description.unwrap_or_default();
 	let input_schema = body.input_schema.unwrap_or_default();
 	let config = body.config.unwrap_or(Value::Null);
 
 	if let Err(error) = validate_action_definition(
-		&state,
+		db,
 		body.object_type_id,
 		&body.operation_kind,
 		&input_schema,
@@ -774,9 +784,9 @@ pub async fn create_action_type(
 	let result = sqlx::query_as::<_, ActionTypeRow>(
 		r#"INSERT INTO action_types (
 		       id, name, display_name, description, object_type_id, operation_kind,
-		       input_schema, config, confirmation_required, permission_key, owner_id
+		       input_schema, config, confirmation_required, permission_key, owner_id, tenant_id
 		   )
-		   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)
+		   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11, $12)
 		   RETURNING id, name, display_name, description, object_type_id, operation_kind,
 		             input_schema, config, confirmation_required, permission_key, owner_id,
 		             created_at, updated_at"#,
@@ -792,12 +802,18 @@ pub async fn create_action_type(
 	.bind(body.confirmation_required.unwrap_or(false))
 	.bind(body.permission_key)
 	.bind(claims.sub)
-	.fetch_one(&state.db)
+	.bind(claims.tenant_scope_id())
+	.fetch_one(&mut *db)
 	.await;
 
 	match result {
 		Ok(row) => match ActionType::try_from(row) {
-			Ok(action_type) => (StatusCode::CREATED, Json(json!(action_type))).into_response(),
+			Ok(action_type) => {
+				if let Err(error) = tx.commit().await {
+					return db_error(format!("failed to commit action type: {error}"));
+				}
+				(StatusCode::CREATED, Json(json!(action_type))).into_response()
+			}
 			Err(e) => db_error(format!("failed to serialize action type: {e}")),
 		},
 		Err(e) => db_error(format!("create action type failed: {e}")),
@@ -805,10 +821,15 @@ pub async fn create_action_type(
 }
 
 pub async fn list_action_types(
-	_user: AuthUser,
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Query(params): Query<ListActionTypesQuery>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
 	let page = params.page.unwrap_or(1).max(1);
 	let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
 	let offset = (page - 1) * per_page;
@@ -821,7 +842,7 @@ pub async fn list_action_types(
 	)
 	.bind(params.object_type_id)
 	.bind(&search_pattern)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *db)
 	.await
 	.unwrap_or(0);
 
@@ -839,7 +860,7 @@ pub async fn list_action_types(
 	.bind(&search_pattern)
 	.bind(per_page)
 	.bind(offset)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *db)
 	.await
 	.unwrap_or_default();
 
@@ -851,15 +872,23 @@ pub async fn list_action_types(
 		}
 	}
 
+	if let Err(error) = tx.commit().await {
+		return db_error(format!("failed to list action types: {error}"));
+	}
 	Json(ListActionTypesResponse { data, total, page, per_page }).into_response()
 }
 
 pub async fn get_action_type(
-	_user: AuthUser,
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-	match load_action_row(&state, id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
+	match load_action_row(db, id).await {
 		Ok(Some(row)) => match ActionType::try_from(row) {
 			Ok(action_type) => Json(json!(action_type)).into_response(),
 			Err(e) => db_error(format!("failed to decode action type: {e}")),
@@ -870,12 +899,17 @@ pub async fn get_action_type(
 }
 
 pub async fn update_action_type(
-	_user: AuthUser,
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(id): Path<Uuid>,
 	Json(body): Json<UpdateActionTypeRequest>,
 ) -> impl IntoResponse {
-	let Some(existing_row) = (match load_action_row(&state, id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
+	let Some(existing_row) = (match load_action_row(db, id).await {
 		Ok(row) => row,
 		Err(e) => return db_error(format!("failed to load action type: {e}")),
 	}) else {
@@ -892,7 +926,7 @@ pub async fn update_action_type(
 	let config = body.config.unwrap_or(existing.config.clone());
 
 	if let Err(error) = validate_action_definition(
-		&state,
+		db,
 		existing.object_type_id,
 		&operation_kind,
 		&input_schema,
@@ -927,12 +961,17 @@ pub async fn update_action_type(
 	.bind(config)
 	.bind(body.confirmation_required)
 	.bind(permission_key)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut *db)
 	.await;
 
 	match result {
 		Ok(Some(row)) => match ActionType::try_from(row) {
-			Ok(action_type) => Json(json!(action_type)).into_response(),
+			Ok(action_type) => {
+				if let Err(error) = tx.commit().await {
+					return db_error(format!("failed to update action type: {error}"));
+				}
+				Json(json!(action_type)).into_response()
+			}
 			Err(e) => db_error(format!("failed to decode action type: {e}")),
 		},
 		Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -941,28 +980,43 @@ pub async fn update_action_type(
 }
 
 pub async fn delete_action_type(
-	_user: AuthUser,
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
 	match sqlx::query("DELETE FROM action_types WHERE id = $1")
 		.bind(id)
-		.execute(&state.db)
+		.execute(&mut *db)
 		.await
 	{
-		Ok(result) if result.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+		Ok(result) if result.rows_affected() > 0 => {
+			if let Err(error) = tx.commit().await {
+				return db_error(format!("failed to delete action type: {error}"));
+			}
+			StatusCode::NO_CONTENT.into_response()
+		}
 		Ok(_) => StatusCode::NOT_FOUND.into_response(),
 		Err(e) => db_error(format!("failed to delete action type: {e}")),
 	}
 }
 
 pub async fn validate_action(
-	_user: AuthUser,
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(id): Path<Uuid>,
 	Json(body): Json<ValidateActionRequest>,
 ) -> impl IntoResponse {
-	let Some(row) = (match load_action_row(&state, id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
+	let Some(row) = (match load_action_row(db, id).await {
 		Ok(row) => row,
 		Err(e) => return db_error(format!("failed to load action type: {e}")),
 	}) else {
@@ -974,7 +1028,7 @@ pub async fn validate_action(
 		Err(e) => return db_error(format!("failed to decode action type: {e}")),
 	};
 
-	match plan_action(&state, &action, &body).await {
+	match plan_action(&state, db, &action, &body).await {
 		Ok(plan) => Json(ValidateActionResponse {
 			valid: true,
 			errors: vec![],
@@ -996,7 +1050,12 @@ pub async fn execute_action(
 	Path(id): Path<Uuid>,
 	Json(body): Json<ExecuteActionRequest>,
 ) -> impl IntoResponse {
-	let Some(row) = (match load_action_row(&state, id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let db = &mut *tx;
+	let Some(row) = (match load_action_row(db, id).await {
 		Ok(row) => row,
 		Err(e) => return db_error(format!("failed to load action type: {e}")),
 	}) else {
@@ -1011,7 +1070,7 @@ pub async fn execute_action(
 		target_object_id: body.target_object_id,
 		parameters: body.parameters,
 	};
-	let plan = match plan_action(&state, &action, &validation_request).await {
+	let plan = match plan_action(&state, db, &action, &validation_request).await {
 		Ok(plan) => plan,
 		Err(errors) => {
 			return (
@@ -1023,7 +1082,7 @@ pub async fn execute_action(
 	};
 	let preview = plan_preview(&plan);
 
-	match plan {
+	let response = match plan {
 		ActionPlan::UpdateObject { target, patch } => {
 			let mut next_properties = target.properties.as_object().cloned().unwrap_or_default();
 			for (key, value) in &patch {
@@ -1039,7 +1098,7 @@ pub async fn execute_action(
 			)
 			.bind(target.id)
 			.bind(Value::Object(next_properties))
-			.fetch_one(&state.db)
+			.fetch_one(&mut *db)
 			.await;
 
 			match updated {
@@ -1065,8 +1124,8 @@ pub async fn execute_action(
 			..
 		} => {
 			let created = sqlx::query_as::<_, LinkInstance>(
-				r#"INSERT INTO link_instances (id, link_type_id, source_object_id, target_object_id, properties, created_by)
-				   VALUES ($1, $2, $3, $4, $5, $6)
+				r#"INSERT INTO link_instances (id, link_type_id, source_object_id, target_object_id, properties, created_by, tenant_id)
+				   VALUES ($1, $2, $3, $4, $5, $6, $7)
 				   RETURNING *"#,
 			)
 			.bind(Uuid::now_v7())
@@ -1075,7 +1134,8 @@ pub async fn execute_action(
 			.bind(target_object_id)
 			.bind(properties)
 			.bind(claims.sub)
-			.fetch_one(&state.db)
+			.bind(claims.tenant_scope_id())
+			.fetch_one(&mut *db)
 			.await;
 
 			match created {
@@ -1094,7 +1154,7 @@ pub async fn execute_action(
 		}
 		ActionPlan::DeleteObject { target } => match sqlx::query("DELETE FROM object_instances WHERE id = $1")
 			.bind(target.id)
-			.execute(&state.db)
+			.execute(&mut *db)
 			.await
 		{
 			Ok(result) if result.rows_affected() > 0 => Json(ExecuteActionResponse {
@@ -1156,7 +1216,7 @@ pub async fn execute_action(
 				};
 
 				let object = match object_patch {
-					Some(patch) => match apply_object_patch(&state, target_object, &patch).await {
+					Some(patch) => match apply_object_patch(db, target_object, &patch).await {
 						Ok(updated) => Some(json!(updated)),
 						Err(e) => return db_error(e),
 					},
@@ -1164,7 +1224,7 @@ pub async fn execute_action(
 				};
 
 				let link = match link_instruction {
-					Some(instruction) => match create_link_from_instruction(&state, claims.sub, target_object, &instruction).await {
+					Some(instruction) => match create_link_from_instruction(db, claims.sub, claims.tenant_scope_id(), target_object, &instruction).await {
 						Ok(created) => Some(json!(created)),
 						Err(e) => return db_error(e),
 					},
@@ -1174,7 +1234,7 @@ pub async fn execute_action(
 				let deleted = if delete_object {
 					match sqlx::query("DELETE FROM object_instances WHERE id = $1")
 						.bind(target_object.id)
-						.execute(&state.db)
+						.execute(&mut *db)
 						.await
 					{
 						Ok(result) if result.rows_affected() > 0 => true,
@@ -1198,5 +1258,11 @@ pub async fn execute_action(
 			}
 			Err(e) => db_error(format!("failed to execute function action: {e}")),
 		},
+	};
+	if response.status().is_success() {
+		if let Err(error) = tx.commit().await {
+			return db_error(format!("failed to commit action execution: {error}"));
+		}
 	}
+	response
 }

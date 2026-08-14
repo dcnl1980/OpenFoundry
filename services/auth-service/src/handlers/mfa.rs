@@ -10,6 +10,7 @@ use crate::models::user::User;
 
 use super::common::json_error;
 use super::login::TokenResponse;
+use super::tenant::{begin_scope, begin_tenant_id};
 
 #[derive(Debug, Serialize)]
 pub struct MfaStatusResponse {
@@ -44,7 +45,11 @@ pub async fn status(
         return json_error(StatusCode::FORBIDDEN, "missing permission mfa:self");
     }
 
-    match load_mfa_configuration(&state.db, claims.sub).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    match load_mfa_configuration(&mut tx, claims.sub).await {
         Ok(Some(configuration)) => Json(MfaStatusResponse {
             configured: true,
             enabled: configuration.enabled,
@@ -75,9 +80,13 @@ pub async fn enroll(
     let enrollment = mfa::create_enrollment(&claims.email);
     let recovery_code_hashes = mfa::hash_recovery_codes(&enrollment.recovery_codes);
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query(
-        r#"INSERT INTO user_mfa_totp (user_id, secret, recovery_code_hashes, enabled)
-           VALUES ($1, $2, $3, false)
+        r#"INSERT INTO user_mfa_totp (user_id, secret, recovery_code_hashes, enabled, tenant_id)
+           VALUES ($1, $2, $3, false, $4)
            ON CONFLICT (user_id) DO UPDATE
            SET secret = EXCLUDED.secret,
                recovery_code_hashes = EXCLUDED.recovery_code_hashes,
@@ -88,7 +97,8 @@ pub async fn enroll(
     .bind(claims.sub)
     .bind(&enrollment.secret)
     .bind(recovery_code_hashes)
-    .execute(&state.db)
+    .bind(claims.tenant_scope_id())
+    .execute(&mut *tx)
     .await
     {
         Ok(_) => Json(EnrollMfaResponse {
@@ -113,7 +123,11 @@ pub async fn verify_setup(
         return json_error(StatusCode::FORBIDDEN, "missing permission mfa:self");
     }
 
-    let Some(configuration) = (match load_mfa_configuration(&state.db, claims.sub).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let Some(configuration) = (match load_mfa_configuration(&mut tx, claims.sub).await {
         Ok(configuration) => configuration,
         Err(e) => {
             tracing::error!("failed to load MFA configuration: {e}");
@@ -131,7 +145,7 @@ pub async fn verify_setup(
         "UPDATE user_mfa_totp SET enabled = true, verified_at = NOW(), updated_at = NOW() WHERE user_id = $1",
     )
     .bind(claims.sub)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     {
         Ok(_) => Json(json!({ "enabled": true })).into_response(),
@@ -151,7 +165,11 @@ pub async fn disable(
         return json_error(StatusCode::FORBIDDEN, "missing permission mfa:self");
     }
 
-    let user = match load_user(&state.db, claims.sub).await {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let user = match load_user(&mut tx, claims.sub).await {
         Ok(Some(user)) => user,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -164,7 +182,7 @@ pub async fn disable(
         return json_error(StatusCode::FORBIDDEN, "mfa is enforced by an administrator");
     }
 
-    let Some(configuration) = (match load_mfa_configuration(&state.db, claims.sub).await {
+    let Some(configuration) = (match load_mfa_configuration(&mut tx, claims.sub).await {
         Ok(configuration) => configuration,
         Err(e) => {
             tracing::error!("failed to load MFA configuration: {e}");
@@ -182,7 +200,7 @@ pub async fn disable(
 
     match sqlx::query("DELETE FROM user_mfa_totp WHERE user_id = $1")
         .bind(claims.sub)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -202,7 +220,11 @@ pub async fn complete_login(
         Err(_) => return json_error(StatusCode::UNAUTHORIZED, "invalid MFA challenge"),
     };
 
-    let user = match load_user(&state.db, challenge.sub).await {
+    let mut tx = match begin_tenant_id(&state, challenge.tenant_scope_id()).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let user = match load_user(&mut tx, challenge.sub).await {
         Ok(Some(user)) => user,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -211,7 +233,7 @@ pub async fn complete_login(
         }
     };
 
-    let Some(configuration) = (match load_mfa_configuration(&state.db, user.id).await {
+    let Some(configuration) = (match load_mfa_configuration(&mut tx, user.id).await {
         Ok(configuration) => configuration,
         Err(e) => {
             tracing::error!("failed to load MFA configuration: {e}");
@@ -241,12 +263,16 @@ pub async fn complete_login(
         )
         .bind(user.id)
         .bind(updated_hashes)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         {
             tracing::error!("failed to consume recovery code: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!("failed to commit MFA completion: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     let mut auth_methods = challenge.auth_methods;
@@ -268,22 +294,22 @@ pub async fn complete_login(
 }
 
 async fn load_mfa_configuration(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     user_id: uuid::Uuid,
 ) -> Result<Option<TotpConfiguration>, sqlx::Error> {
     sqlx::query_as::<_, TotpConfiguration>(
         "SELECT user_id, secret, recovery_code_hashes, enabled, verified_at, created_at, updated_at FROM user_mfa_totp WHERE user_id = $1",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }
 
-async fn load_user(pool: &sqlx::PgPool, user_id: uuid::Uuid) -> Result<Option<User>, sqlx::Error> {
+async fn load_user(conn: &mut sqlx::PgConnection, user_id: uuid::Uuid) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
         "SELECT id, email, name, password_hash, is_active, organization_id, attributes, mfa_enforced, auth_source, created_at, updated_at FROM users WHERE id = $1",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }

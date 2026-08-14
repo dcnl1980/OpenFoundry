@@ -34,6 +34,8 @@ pub struct ReviewRow {
 	pub body: String,
 	pub recommended: bool,
 	pub created_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<ReviewRow> for ListingReview {

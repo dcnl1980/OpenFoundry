@@ -11,6 +11,8 @@ use crate::models::cell::{Cell, CreateCellRequest, UpdateCellRequest};
 use crate::AppState;
 use auth_middleware::layer::AuthUser;
 
+use super::tenant::begin_scope;
+
 // ── Notebook CRUD ──
 
 pub async fn create_notebook(
@@ -18,25 +20,37 @@ pub async fn create_notebook(
     State(state): State<AppState>,
     Json(body): Json<CreateNotebookRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let id = Uuid::now_v7();
     let description = body.description.unwrap_or_default();
     let kernel = body.default_kernel.unwrap_or_else(|| "python".to_string());
+    let tenant_id = claims.tenant_scope_id();
 
     let result = sqlx::query_as::<_, Notebook>(
-        r#"INSERT INTO notebooks (id, name, description, owner_id, default_kernel)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO notebooks (id, name, description, owner_id, tenant_id, default_kernel)
+           VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING *"#,
     )
     .bind(id)
     .bind(&body.name)
     .bind(&description)
     .bind(claims.sub)
+    .bind(tenant_id)
     .bind(&kernel)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(nb) => (StatusCode::CREATED, Json(serde_json::json!(nb))).into_response(),
+        Ok(nb) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("create notebook commit failed: {error}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(nb))).into_response()
+        }
         Err(e) => {
             tracing::error!("create notebook: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -45,10 +59,14 @@ pub async fn create_notebook(
 }
 
 pub async fn list_notebooks(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Query(params): Query<ListNotebooksQuery>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -57,7 +75,7 @@ pub async fn list_notebooks(
 
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notebooks WHERE name ILIKE $1")
         .bind(&pattern)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .unwrap_or(0);
 
@@ -68,44 +86,63 @@ pub async fn list_notebooks(
     .bind(&pattern)
     .bind(per_page)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .unwrap_or_default();
 
-    Json(serde_json::json!({ "data": notebooks, "total": total, "page": page, "per_page": per_page }))
+    if let Err(error) = tx.commit().await {
+        tracing::error!("list notebooks commit failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(serde_json::json!({ "data": notebooks, "total": total, "page": page, "per_page": per_page })).into_response()
 }
 
 pub async fn get_notebook(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let notebook = sqlx::query_as::<_, Notebook>("SELECT * FROM notebooks WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await;
 
     let cells = sqlx::query_as::<_, Cell>(
         "SELECT * FROM cells WHERE notebook_id = $1 ORDER BY position ASC",
     )
     .bind(id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .unwrap_or_default();
 
     match notebook {
-        Ok(Some(nb)) => Json(serde_json::json!({ "notebook": nb, "cells": cells })).into_response(),
+        Ok(Some(nb)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("get notebook commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!({ "notebook": nb, "cells": cells })).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn update_notebook(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateNotebookRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query_as::<_, Notebook>(
         r#"UPDATE notebooks SET
            name = COALESCE($2, name),
@@ -118,27 +155,43 @@ pub async fn update_notebook(
     .bind(&body.name)
     .bind(&body.description)
     .bind(&body.default_kernel)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
-        Ok(Some(nb)) => Json(serde_json::json!(nb)).into_response(),
+        Ok(Some(nb)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("update notebook commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!(nb)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn delete_notebook(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM notebooks WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("delete notebook commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -147,11 +200,15 @@ pub async fn delete_notebook(
 // ── Cell CRUD ──
 
 pub async fn add_cell(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path(notebook_id): Path<Uuid>,
     Json(body): Json<CreateCellRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let id = Uuid::now_v7();
     let cell_type = body.cell_type.unwrap_or_else(|| "code".to_string());
     let kernel = body.kernel.unwrap_or_else(|| "python".to_string());
@@ -162,7 +219,7 @@ pub async fn add_cell(
         "SELECT MAX(position) FROM cells WHERE notebook_id = $1",
     )
     .bind(notebook_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(None);
 
@@ -179,21 +236,31 @@ pub async fn add_cell(
     .bind(&kernel)
     .bind(&source)
     .bind(position)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
-        Ok(cell) => (StatusCode::CREATED, Json(serde_json::json!(cell))).into_response(),
+        Ok(cell) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("add cell commit failed: {error}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(cell))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn update_cell(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path((_notebook_id, cell_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateCellRequest>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let result = sqlx::query_as::<_, Cell>(
         r#"UPDATE cells SET
            source = COALESCE($2, source),
@@ -208,27 +275,43 @@ pub async fn update_cell(
     .bind(&body.cell_type)
     .bind(&body.kernel)
     .bind(body.position)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
-        Ok(Some(c)) => Json(serde_json::json!(c)).into_response(),
+        Ok(Some(c)) => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("update cell commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Json(serde_json::json!(c)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 pub async fn delete_cell(
-    _user: AuthUser,
+    AuthUser(claims): AuthUser,
     State(state): State<AppState>,
     Path((_notebook_id, cell_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM cells WHERE id = $1")
         .bind(cell_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Err(error) = tx.commit().await {
+                tracing::error!("delete cell commit failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

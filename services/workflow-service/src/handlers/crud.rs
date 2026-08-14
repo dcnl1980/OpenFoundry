@@ -5,6 +5,7 @@ use axum::{
 	Json,
 };
 use serde_json::Value;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -14,11 +15,19 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
+
+use super::tenant::begin_scope;
 
 pub async fn list_workflows(
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Query(params): Query<ListWorkflowsQuery>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let page = params.page.unwrap_or(1).max(1);
 	let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
 	let offset = (page - 1) * per_page;
@@ -37,7 +46,7 @@ pub async fn list_workflows(
 	.bind(&params.status)
 	.bind(per_page)
 	.bind(offset)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await;
 
 	let total = sqlx::query_scalar::<_, i64>(
@@ -49,19 +58,25 @@ pub async fn list_workflows(
 	.bind(&search_pattern)
 	.bind(&params.trigger_type)
 	.bind(&params.status)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.unwrap_or(0);
 
 	match workflows {
-		Ok(data) => Json(serde_json::json!({
-			"data": data,
-			"page": page,
-			"per_page": per_page,
-			"total": total,
-			"total_pages": (total as f64 / per_page as f64).ceil() as i64,
-		}))
-		.into_response(),
+		Ok(data) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("list workflows commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(serde_json::json!({
+				"data": data,
+				"page": page,
+				"per_page": per_page,
+				"total": total,
+				"total_pages": (total as f64 / per_page as f64).ceil() as i64,
+			}))
+			.into_response()
+		}
 		Err(error) => {
 			tracing::error!("list workflows failed: {error}");
 			StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -71,9 +86,13 @@ pub async fn list_workflows(
 
 pub async fn create_workflow(
 	State(state): State<AppState>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateWorkflowRequest>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let steps = match serde_json::to_value(&body.steps) {
 		Ok(value) => value,
 		Err(error) => {
@@ -85,17 +104,19 @@ pub async fn create_workflow(
 		}
 	};
 
+	let tenant_id = claims.tenant_scope_id();
 	let workflow = sqlx::query_as::<_, WorkflowDefinition>(
 		r#"INSERT INTO workflows (
-			   id, name, description, owner_id, status, trigger_type, trigger_config, steps, webhook_secret, next_run_at
+			   id, name, description, owner_id, tenant_id, status, trigger_type, trigger_config, steps, webhook_secret, next_run_at
 		   )
-		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		   RETURNING *"#,
 	)
 	.bind(Uuid::now_v7())
 	.bind(&body.name)
 	.bind(body.description.as_deref().unwrap_or(""))
 	.bind(claims.sub)
+	.bind(tenant_id)
 	.bind(body.status.as_deref().unwrap_or("draft"))
 	.bind(&body.trigger_type)
 	.bind(&body.trigger_config)
@@ -107,7 +128,7 @@ pub async fn create_workflow(
 			.map(str::to_string),
 	)
 	.bind(Option::<chrono::DateTime<chrono::Utc>>::None)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await;
 
 	match workflow {
@@ -119,11 +140,16 @@ pub async fn create_workflow(
 				)
 				.bind(workflow.id)
 				.bind(next_run_at)
-				.fetch_one(&state.db)
+				.fetch_one(&mut *tx)
 				.await
 				{
 					workflow = updated;
 				}
+			}
+
+			if let Err(error) = tx.commit().await {
+				tracing::error!("create workflow commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 			}
 
 			(StatusCode::CREATED, Json(workflow)).into_response()
@@ -136,11 +162,22 @@ pub async fn create_workflow(
 }
 
 pub async fn get_workflow(
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(workflow_id): Path<Uuid>,
 ) -> impl IntoResponse {
-	match load_workflow(&state, workflow_id).await {
-		Ok(Some(workflow)) => Json(workflow).into_response(),
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	match load_workflow(&mut tx, workflow_id).await {
+		Ok(Some(workflow)) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("get workflow commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			Json(workflow).into_response()
+		}
 		Ok(None) => StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
 			tracing::error!("get workflow failed: {error}");
@@ -150,11 +187,16 @@ pub async fn get_workflow(
 }
 
 pub async fn update_workflow(
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(workflow_id): Path<Uuid>,
 	Json(body): Json<UpdateWorkflowRequest>,
 ) -> impl IntoResponse {
-	let Some(existing) = (match load_workflow(&state, workflow_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let Some(existing) = (match load_workflow(&mut tx, workflow_id).await {
 		Ok(workflow) => workflow,
 		Err(error) => {
 			tracing::error!("load workflow for update failed: {error}");
@@ -211,7 +253,7 @@ pub async fn update_workflow(
 			.map(str::to_string),
 	)
 	.bind(Option::<chrono::DateTime<chrono::Utc>>::None)
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await;
 
 	match updated {
@@ -222,10 +264,15 @@ pub async fn update_workflow(
 			)
 			.bind(workflow.id)
 			.bind(next_run_at)
-			.fetch_one(&state.db)
+			.fetch_one(&mut *tx)
 			.await
 			{
 				workflow = reloaded;
+			}
+
+			if let Err(error) = tx.commit().await {
+				tracing::error!("update workflow commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 			}
 
 			Json(workflow).into_response()
@@ -238,15 +285,26 @@ pub async fn update_workflow(
 }
 
 pub async fn delete_workflow(
+	AuthUser(claims): AuthUser,
 	State(state): State<AppState>,
 	Path(workflow_id): Path<Uuid>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	match sqlx::query("DELETE FROM workflows WHERE id = $1")
 		.bind(workflow_id)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await
 	{
-		Ok(result) if result.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+		Ok(result) if result.rows_affected() > 0 => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("delete workflow commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
+			StatusCode::NO_CONTENT.into_response()
+		}
 		Ok(_) => StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
 			tracing::error!("delete workflow failed: {error}");
@@ -256,11 +314,11 @@ pub async fn delete_workflow(
 }
 
 pub async fn load_workflow(
-	state: &AppState,
+	tx: &mut Transaction<'_, Postgres>,
 	workflow_id: Uuid,
 ) -> Result<Option<WorkflowDefinition>, sqlx::Error> {
 	sqlx::query_as::<_, WorkflowDefinition>("SELECT * FROM workflows WHERE id = $1")
 		.bind(workflow_id)
-		.fetch_optional(&state.db)
+		.fetch_optional(&mut **tx)
 		.await
 }

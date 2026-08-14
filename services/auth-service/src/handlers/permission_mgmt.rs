@@ -6,6 +6,7 @@ use crate::AppState;
 use crate::models::permission::Permission;
 
 use super::common::{json_error, require_permission};
+use super::tenant::begin_scope;
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePermissionRequest {
@@ -22,10 +23,14 @@ pub async fn list_permissions(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Permission>(
         "SELECT id, resource, action, description, created_at FROM permissions ORDER BY resource, action",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     {
         Ok(permissions) => Json(permissions).into_response(),
@@ -45,16 +50,21 @@ pub async fn create_permission(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Permission>(
-        r#"INSERT INTO permissions (id, resource, action, description)
-           VALUES ($1, $2, $3, $4)
+        r#"INSERT INTO permissions (id, resource, action, description, tenant_id)
+           VALUES ($1, $2, $3, $4, $5)
            RETURNING id, resource, action, description, created_at"#,
     )
     .bind(uuid::Uuid::now_v7())
     .bind(body.resource)
     .bind(body.action)
     .bind(body.description)
-    .fetch_one(&state.db)
+    .bind(claims.tenant_scope_id())
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(permission) => (axum::http::StatusCode::CREATED, Json(permission)).into_response(),

@@ -5,6 +5,7 @@ use axum::{
 use chrono::Utc;
 use sqlx::{query_as, types::Json as SqlJson};
 use uuid::Uuid;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	domain::rag,
@@ -17,10 +18,10 @@ use crate::{
 	AppState,
 };
 
-use super::{bad_request, db_error, not_found, ServiceResult};
+use super::{bad_request, db_error, internal_error, not_found, tenant::begin_scope, ServiceResult};
 
 async fn load_knowledge_base_row(
-	db: &sqlx::PgPool,
+	db: &mut sqlx::PgConnection,
 	knowledge_base_id: Uuid,
 ) -> Result<Option<KnowledgeBaseRow>, sqlx::Error> {
 	query_as::<_, KnowledgeBaseRow>(
@@ -42,13 +43,17 @@ async fn load_knowledge_base_row(
 		"#,
 	)
 	.bind(knowledge_base_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut *db)
 	.await
 }
 
 pub async fn list_knowledge_bases(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListKnowledgeBasesResponse> {
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
 	let rows = query_as::<_, KnowledgeBaseRow>(
 		r#"
 		SELECT
@@ -67,9 +72,13 @@ pub async fn list_knowledge_bases(
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list knowledge bases commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ListKnowledgeBasesResponse {
 		data: rows.into_iter().map(Into::into).collect(),
@@ -78,12 +87,17 @@ pub async fn list_knowledge_bases(
 
 pub async fn create_knowledge_base(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateKnowledgeBaseRequest>,
 ) -> ServiceResult<KnowledgeBase> {
 	if body.name.trim().is_empty() {
 		return Err(bad_request("knowledge base name is required"));
 	}
 
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let tenant_id = claims.tenant_scope_id();
 	let row = query_as::<_, KnowledgeBaseRow>(
 		r#"
 		INSERT INTO ai_knowledge_bases (
@@ -95,9 +109,10 @@ pub async fn create_knowledge_base(
 			chunking_strategy,
 			tags,
 			document_count,
-			chunk_count
+			chunk_count,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8)
 		RETURNING
 			id,
 			name,
@@ -119,19 +134,28 @@ pub async fn create_knowledge_base(
 	.bind(body.embedding_provider)
 	.bind(body.chunking_strategy)
 	.bind(SqlJson(body.tags))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create knowledge base commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn update_knowledge_base(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(knowledge_base_id): Path<Uuid>,
 	Json(body): Json<UpdateKnowledgeBaseRequest>,
 ) -> ServiceResult<KnowledgeBase> {
-	let Some(current) = load_knowledge_base_row(&state.db, knowledge_base_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(current) = load_knowledge_base_row(&mut tx, knowledge_base_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -171,18 +195,26 @@ pub async fn update_knowledge_base(
 	.bind(body.embedding_provider.unwrap_or(knowledge_base.embedding_provider))
 	.bind(body.chunking_strategy.unwrap_or(knowledge_base.chunking_strategy))
 	.bind(SqlJson(body.tags.unwrap_or(knowledge_base.tags)))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("update knowledge base commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn list_documents(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(knowledge_base_id): Path<Uuid>,
 ) -> ServiceResult<ListKnowledgeDocumentsResponse> {
-	load_knowledge_base_row(&state.db, knowledge_base_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	load_knowledge_base_row(&mut tx, knowledge_base_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("knowledge base not found"))?;
@@ -207,9 +239,13 @@ pub async fn list_documents(
 		"#,
 	)
 	.bind(knowledge_base_id)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("list documents commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(ListKnowledgeDocumentsResponse {
 		data: rows.into_iter().map(Into::into).collect(),
@@ -218,10 +254,14 @@ pub async fn list_documents(
 
 pub async fn create_document(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(knowledge_base_id): Path<Uuid>,
 	Json(body): Json<CreateKnowledgeDocumentRequest>,
 ) -> ServiceResult<KnowledgeDocument> {
-	let Some(knowledge_base_row) = load_knowledge_base_row(&state.db, knowledge_base_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	let Some(knowledge_base_row) = load_knowledge_base_row(&mut tx, knowledge_base_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -235,6 +275,7 @@ pub async fn create_document(
 	let document_id = Uuid::now_v7();
 	let knowledge_base: KnowledgeBase = knowledge_base_row.into();
 	let chunks = rag::indexer::index_document(document_id, &body.content, &knowledge_base.chunking_strategy);
+	let tenant_id = claims.tenant_scope_id();
 
 	let row = query_as::<_, KnowledgeDocumentRow>(
 		r#"
@@ -247,9 +288,10 @@ pub async fn create_document(
 			metadata,
 			status,
 			chunk_count,
-			chunks
+			chunks,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, 'indexed', $7, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, 'indexed', $7, $8, $9)
 		RETURNING
 			id,
 			knowledge_base_id,
@@ -272,7 +314,8 @@ pub async fn create_document(
 	.bind(SqlJson(body.metadata))
 	.bind(chunks.len() as i32)
 	.bind(SqlJson(chunks.clone()))
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -281,15 +324,20 @@ pub async fn create_document(
 	)
 	.bind(knowledge_base_id)
 	.bind(chunks.len() as i64)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("create document commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	Ok(Json(row.into()))
 }
 
 pub async fn search_knowledge_base(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(knowledge_base_id): Path<Uuid>,
 	Json(body): Json<SearchKnowledgeBaseRequest>,
 ) -> ServiceResult<SearchKnowledgeBaseResponse> {
@@ -297,7 +345,10 @@ pub async fn search_knowledge_base(
 		return Err(bad_request("search query is required"));
 	}
 
-	load_knowledge_base_row(&state.db, knowledge_base_id)
+	let mut tx = begin_scope(&state, &claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))?;
+	load_knowledge_base_row(&mut tx, knowledge_base_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("knowledge base not found"))?;
@@ -322,9 +373,13 @@ pub async fn search_knowledge_base(
 		"#,
 	)
 	.bind(knowledge_base_id)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|error| {
+		tracing::error!("search knowledge base commit failed: {error}");
+		internal_error("commit failed")
+	})?;
 
 	let documents = rows.into_iter().map(Into::into).collect::<Vec<_>>();
 	let results = rag::retriever::search(&body.query, &documents, body.top_k, body.min_score);

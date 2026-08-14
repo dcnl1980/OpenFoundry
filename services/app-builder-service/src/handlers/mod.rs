@@ -2,10 +2,12 @@ pub mod apps;
 pub mod pages;
 pub mod preview;
 pub mod publish;
+pub mod tenant;
 pub mod widgets;
 
+use auth_middleware::Claims;
 use axum::http::StatusCode;
-use sqlx::types::Json;
+use sqlx::{types::Json, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -39,7 +41,7 @@ pub fn internal_error(message: impl Into<String>) -> (StatusCode, String) {
 pub fn db_error(error: sqlx::Error) -> (StatusCode, String) {
 	if let Some(database_error) = error.as_database_error() {
 		if let Some(constraint) = database_error.constraint() {
-			if constraint == "apps_slug_key" {
+			if constraint == "apps_slug_key" || constraint == "apps_tenant_slug_key" {
 				return conflict("app slug already exists");
 			}
 		}
@@ -126,28 +128,39 @@ fn sanitize_widgets(widgets: &mut [WidgetDefinition]) {
 	}
 }
 
-pub async fn load_app(state: &AppState, app_id: Uuid) -> ServiceResult<App> {
-	let row = sqlx::query_as::<_, AppRow>(
-		"SELECT id, name, slug, description, status, pages, theme, settings, template_key, created_by, published_version_id, created_at, updated_at
-		 FROM apps
-		 WHERE id = $1",
-	)
-	.bind(app_id)
-	.fetch_optional(&state.db)
-	.await
-	.map_err(db_error)?;
+pub async fn scoped_tx<'a>(
+	state: &'a AppState,
+	claims: &Claims,
+) -> ServiceResult<Transaction<'a, Postgres>> {
+	tenant::begin_scope(state, claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))
+}
+
+pub async fn load_app(
+	tx: &mut Transaction<'_, Postgres>,
+	app_id: Uuid,
+) -> ServiceResult<App> {
+	let row = sqlx::query_as::<_, AppRow>("SELECT * FROM apps WHERE id = $1")
+		.bind(app_id)
+		.fetch_optional(&mut **tx)
+		.await
+		.map_err(db_error)?;
 
 	row.map(Into::into).ok_or_else(|| not_found("app"))
 }
 
-pub async fn load_template_by_key(state: &AppState, key: &str) -> ServiceResult<AppTemplate> {
+pub async fn load_template_by_key(
+	tx: &mut Transaction<'_, Postgres>,
+	key: &str,
+) -> ServiceResult<AppTemplate> {
 	let row = sqlx::query_as::<_, AppTemplateRow>(
 		"SELECT id, key, name, description, category, preview_image_url, definition, created_at
 		 FROM app_templates
 		 WHERE key = $1",
 	)
 	.bind(key)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await
 	.map_err(db_error)?;
 
@@ -155,14 +168,15 @@ pub async fn load_template_by_key(state: &AppState, key: &str) -> ServiceResult<
 		.ok_or_else(|| not_found("app template"))
 }
 
-pub async fn load_published_app(state: &AppState, slug: &str) -> ServiceResult<(App, AppVersion)> {
+pub async fn load_published_app(
+	tx: &mut Transaction<'_, Postgres>,
+	slug: &str,
+) -> ServiceResult<(App, AppVersion)> {
 	let app_row = sqlx::query_as::<_, AppRow>(
-		"SELECT id, name, slug, description, status, pages, theme, settings, template_key, created_by, published_version_id, created_at, updated_at
-		 FROM apps
-		 WHERE slug = $1 AND published_version_id IS NOT NULL",
+		"SELECT * FROM apps WHERE slug = $1 AND published_version_id IS NOT NULL",
 	)
 	.bind(slug)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await
 	.map_err(db_error)?;
 
@@ -172,12 +186,10 @@ pub async fn load_published_app(state: &AppState, slug: &str) -> ServiceResult<(
 		.ok_or_else(|| not_found("published app version"))?;
 
 	let version_row = sqlx::query_as::<_, AppVersionRow>(
-		"SELECT id, app_id, version_number, status, app_snapshot, notes, created_by, created_at, published_at
-		 FROM app_versions
-		 WHERE id = $1",
+		"SELECT * FROM app_versions WHERE id = $1",
 	)
 	.bind(version_id)
-	.fetch_optional(&state.db)
+	.fetch_optional(&mut **tx)
 	.await
 	.map_err(db_error)?;
 
@@ -188,7 +200,10 @@ pub async fn load_published_app(state: &AppState, slug: &str) -> ServiceResult<(
 	Ok((app, version))
 }
 
-pub async fn persist_app(state: &AppState, app: &App) -> ServiceResult<App> {
+pub async fn persist_app(
+	tx: &mut Transaction<'_, Postgres>,
+	app: &App,
+) -> ServiceResult<App> {
 	let row = sqlx::query_as::<_, AppRow>(
 		"UPDATE apps
 		 SET name = $2,
@@ -202,7 +217,7 @@ pub async fn persist_app(state: &AppState, app: &App) -> ServiceResult<App> {
 			 published_version_id = $10,
 			 updated_at = NOW()
 		 WHERE id = $1
-		 RETURNING id, name, slug, description, status, pages, theme, settings, template_key, created_by, published_version_id, created_at, updated_at",
+		 RETURNING *",
 	)
 	.bind(app.id)
 	.bind(&app.name)
@@ -214,7 +229,7 @@ pub async fn persist_app(state: &AppState, app: &App) -> ServiceResult<App> {
 	.bind(Json(app.settings.clone()))
 	.bind(&app.template_key)
 	.bind(app.published_version_id)
-	.fetch_one(&state.db)
+	.fetch_one(&mut **tx)
 	.await
 	.map_err(db_error)?;
 

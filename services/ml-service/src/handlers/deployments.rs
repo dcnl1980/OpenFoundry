@@ -4,7 +4,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::{json, Value};
-use sqlx::{query_as, FromRow};
+use sqlx::{query_as, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -15,8 +15,12 @@ use crate::{
 	},
 	AppState,
 };
+use auth_middleware::layer::AuthUser;
 
-use super::{bad_request, db_error, deserialize_json, deserialize_optional_json, not_found, to_json, ServiceResult};
+use super::{
+	bad_request, db_error, deserialize_json, deserialize_optional_json, not_found,
+	tenant::begin_scope, to_json, ServiceResult,
+};
 
 #[derive(Debug, FromRow)]
 struct DeploymentRow {
@@ -52,7 +56,7 @@ fn to_deployment(row: DeploymentRow) -> ModelDeployment {
 }
 
 async fn load_deployment_row(
-	db: &sqlx::PgPool,
+	tx: &mut Transaction<'_, Postgres>,
 	deployment_id: Uuid,
 ) -> Result<Option<DeploymentRow>, sqlx::Error> {
 	query_as::<_, DeploymentRow>(
@@ -75,7 +79,7 @@ async fn load_deployment_row(
 		"#,
 	)
 	.bind(deployment_id)
-	.fetch_optional(db)
+	.fetch_optional(&mut **tx)
 	.await
 }
 
@@ -131,7 +135,9 @@ fn normalize_traffic_split(
 
 pub async fn list_deployments(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<ListDeploymentsResponse> {
+	let mut tx = begin_scope(&state, &claims).await?;
 	let rows = query_as::<_, DeploymentRow>(
 		r#"
 		SELECT
@@ -151,9 +157,10 @@ pub async fn list_deployments(
 		ORDER BY updated_at DESC, created_at DESC
 		"#,
 	)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(ListDeploymentsResponse {
 		data: rows.into_iter().map(to_deployment).collect(),
@@ -162,6 +169,7 @@ pub async fn list_deployments(
 
 pub async fn create_deployment(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<CreateDeploymentRequest>,
 ) -> ServiceResult<ModelDeployment> {
 	if body.name.trim().is_empty() || body.endpoint_path.trim().is_empty() {
@@ -171,6 +179,8 @@ pub async fn create_deployment(
 	let traffic_split = normalize_traffic_split(&body.strategy_type, body.traffic_split)
 		.map_err(bad_request)?;
 	let deployment_id = Uuid::now_v7();
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
 
 	let row = query_as::<_, DeploymentRow>(
 		r#"
@@ -184,9 +194,10 @@ pub async fn create_deployment(
 			traffic_split,
 			monitoring_window,
 			baseline_dataset_id,
-			drift_report
+			drift_report,
+			tenant_id
 		)
-		VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, NULL)
+		VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, NULL, $9)
 		RETURNING
 			id,
 			model_id,
@@ -210,7 +221,8 @@ pub async fn create_deployment(
 	.bind(to_json(&traffic_split))
 	.bind(body.monitoring_window)
 	.bind(body.baseline_dataset_id)
-	.fetch_one(&state.db)
+	.bind(tenant_id)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -219,19 +231,22 @@ pub async fn create_deployment(
 	)
 	.bind(row.model_id)
 	.bind(deployment_id)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_deployment(row)))
 }
 
 pub async fn update_deployment(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(deployment_id): Path<Uuid>,
 	Json(body): Json<UpdateDeploymentRequest>,
 ) -> ServiceResult<ModelDeployment> {
-	let Some(current) = load_deployment_row(&state.db, deployment_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let Some(current) = load_deployment_row(&mut tx, deployment_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -286,7 +301,7 @@ pub async fn update_deployment(
 	.bind(to_json(&traffic_split))
 	.bind(body.monitoring_window.unwrap_or(current.monitoring_window))
 	.bind(body.baseline_dataset_id.or(current.baseline_dataset_id))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
@@ -296,7 +311,7 @@ pub async fn update_deployment(
 		)
 		.bind(row.model_id)
 		.bind(deployment_id)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	} else {
@@ -305,20 +320,24 @@ pub async fn update_deployment(
 		)
 		.bind(row.model_id)
 		.bind(deployment_id)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 	}
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_deployment(row)))
 }
 
 pub async fn generate_drift_report(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(deployment_id): Path<Uuid>,
 	Json(body): Json<GenerateDriftReportRequest>,
 ) -> ServiceResult<ModelDeployment> {
-	let Some(current) = load_deployment_row(&state.db, deployment_id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let tenant_id = claims.tenant_scope_id();
+	let Some(current) = load_deployment_row(&mut tx, deployment_id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 	else {
@@ -347,9 +366,10 @@ pub async fn generate_drift_report(
 				submitted_at,
 				started_at,
 				completed_at,
-				created_at
+				created_at,
+				tenant_id
 			)
-			VALUES ($1, NULL, $2, $3, 'queued', $4, $5, $6, $7, $8, NULL, $9, NULL, NULL, $9)
+			VALUES ($1, NULL, $2, $3, 'queued', $4, $5, $6, $7, $8, NULL, $9, NULL, NULL, $9, $10)
 			"#,
 		)
 		.bind(job_id)
@@ -365,7 +385,8 @@ pub async fn generate_drift_report(
 		.bind("drift_recovery")
 		.bind(json!([]))
 		.bind(Utc::now())
-		.execute(&state.db)
+		.bind(tenant_id)
+		.execute(&mut *tx)
 		.await
 		.map_err(|cause| db_error(&cause))?;
 
@@ -396,9 +417,10 @@ pub async fn generate_drift_report(
 	)
 	.bind(deployment_id)
 	.bind(to_json(&report))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 
 	Ok(Json(to_deployment(row)))
 }

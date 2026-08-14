@@ -1,3 +1,4 @@
+use auth_middleware::begin_tenant_transaction;
 use auth_middleware::jwt::{self, JwtConfig};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,7 +14,10 @@ pub async fn issue_tokens(
     user: &User,
     auth_methods: Vec<String>,
 ) -> Result<(String, String), auth_middleware::JwtError> {
-    let access_bundle = rbac::get_user_access_bundle(pool, user.id)
+    let mut tx = begin_tenant_transaction(pool, user.tenant_scope_id())
+        .await
+        .map_err(|error| auth_middleware::JwtError::Encoding(error.to_string()))?;
+    let access_bundle = rbac::get_user_access_bundle(&mut tx, user.id)
         .await
         .unwrap_or_default();
 
@@ -33,13 +37,16 @@ pub async fn issue_tokens(
     let access_token = jwt::encode_token(config, &access_claims)?;
     let refresh_token = jwt::encode_token(config, &refresh_claims)?;
 
-    let _ = store_refresh_token(pool, user.id, refresh_claims.jti, &refresh_token, refresh_claims.exp).await;
+    let _ = store_refresh_token(&mut tx, user.id, refresh_claims.jti, &refresh_token, refresh_claims.exp).await;
+    tx.commit()
+        .await
+        .map_err(|error| auth_middleware::JwtError::Encoding(error.to_string()))?;
 
     Ok((access_token, refresh_token))
 }
 
 pub async fn store_refresh_token(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     user_id: Uuid,
     token_id: Uuid,
     refresh_token: &str,
@@ -61,29 +68,32 @@ pub async fn store_refresh_token(
     .bind(user_id)
     .bind(security::hash_token(refresh_token))
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
 }
 
-pub async fn revoke_refresh_token(pool: &PgPool, token_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn revoke_refresh_token(
+    conn: &mut sqlx::PgConnection,
+    token_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE refresh_tokens SET revoked = true WHERE id = $1")
         .bind(token_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
 pub async fn get_refresh_token(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     token_id: Uuid,
 ) -> Result<Option<RefreshToken>, sqlx::Error> {
     sqlx::query_as::<_, RefreshToken>(
         "SELECT id, user_id, token_hash, expires_at, revoked, created_at FROM refresh_tokens WHERE id = $1",
     )
     .bind(token_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
 }
 

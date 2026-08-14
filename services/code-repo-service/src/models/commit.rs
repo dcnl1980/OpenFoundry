@@ -69,6 +69,8 @@ pub struct CommitRow {
 	pub additions: i32,
 	pub deletions: i32,
 	pub created_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -83,6 +85,8 @@ pub struct CiRunRow {
 	pub started_at: DateTime<Utc>,
 	pub completed_at: Option<DateTime<Utc>>,
 	pub checks: Value,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<CommitRow> for CommitDefinition {

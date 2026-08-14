@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub struct DatasetVersion {
     pub id: Uuid,
     pub dataset_id: Uuid,
+    pub tenant_id: Uuid,
     pub version: i32,
     pub message: String,
     pub size_bytes: i64,

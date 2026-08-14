@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, FromRow)]
@@ -20,14 +20,16 @@ pub struct CatalogFacets {
 	pub owners: Vec<CatalogOwnerFacet>,
 }
 
-pub async fn fetch_catalog_facets(pool: &sqlx::PgPool) -> Result<CatalogFacets, sqlx::Error> {
+pub async fn fetch_catalog_facets(
+	tx: &mut Transaction<'_, Postgres>,
+) -> Result<CatalogFacets, sqlx::Error> {
 	let tags = sqlx::query_as::<_, CatalogTagFacet>(
 		r#"SELECT tag AS value, COUNT(*) AS count
 		   FROM datasets, unnest(tags) AS tag
 		   GROUP BY tag
 		   ORDER BY count DESC, tag ASC"#,
 	)
-	.fetch_all(pool)
+	.fetch_all(&mut **tx)
 	.await?;
 
 	let owners = sqlx::query_as::<_, CatalogOwnerFacet>(
@@ -36,7 +38,7 @@ pub async fn fetch_catalog_facets(pool: &sqlx::PgPool) -> Result<CatalogFacets, 
 		   GROUP BY owner_id
 		   ORDER BY count DESC, owner_id ASC"#,
 	)
-	.fetch_all(pool)
+	.fetch_all(&mut **tx)
 	.await?;
 
 	Ok(CatalogFacets { tags, owners })

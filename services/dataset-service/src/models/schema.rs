@@ -14,6 +14,7 @@ pub struct SchemaField {
 pub struct DatasetSchema {
     pub id: Uuid,
     pub dataset_id: Uuid,
+    pub tenant_id: Uuid,
     pub fields: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }

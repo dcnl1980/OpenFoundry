@@ -34,6 +34,8 @@ pub struct SyncStatusRow {
 	pub next_sync_at: Option<DateTime<Utc>>,
 	pub audit_cursor: String,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: uuid::Uuid,
 }
 
 impl TryFrom<SyncStatusRow> for SyncStatus {

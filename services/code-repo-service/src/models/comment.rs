@@ -36,6 +36,8 @@ pub struct CommentRow {
 	pub line_number: Option<i32>,
 	pub resolved: bool,
 	pub created_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<CommentRow> for ReviewComment {

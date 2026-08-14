@@ -2,6 +2,7 @@ pub mod browse;
 pub mod install;
 pub mod publish;
 pub mod reviews;
+pub mod tenant;
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
@@ -37,21 +38,37 @@ pub fn db_error(cause: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
 	internal_error("database operation failed")
 }
 
-pub async fn load_listing_row(db: &sqlx::PgPool, id: uuid::Uuid) -> Result<Option<ListingRow>, sqlx::Error> {
-	sqlx::query_as::<_, ListingRow>(
-		"SELECT id, name, slug, summary, description, publisher, category_slug, package_kind, repository_slug, visibility, tags, capabilities, install_count, average_rating, created_at, updated_at
-		 FROM marketplace_listings
-		 WHERE id = $1",
-	)
-	.bind(id)
-	.fetch_optional(db)
-	.await
+pub async fn open_scope<'a>(
+	state: &'a crate::AppState,
+	claims: &auth_middleware::Claims,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>, (StatusCode, Json<ErrorResponse>)> {
+	tenant::begin_scope(state, claims)
+		.await
+		.map_err(|_| internal_error("tenant scope failed"))
 }
 
-pub async fn load_listings(db: &sqlx::PgPool) -> Result<Vec<crate::models::listing::ListingDefinition>, sqlx::Error> {
+pub async fn commit_scope(
+	tx: sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+	tx.commit().await.map_err(|cause| db_error(&cause))
+}
+
+pub async fn load_listing_row<'e, E>(db: E, id: uuid::Uuid) -> Result<Option<ListingRow>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+	sqlx::query_as::<_, ListingRow>("SELECT * FROM marketplace_listings WHERE id = $1")
+		.bind(id)
+		.fetch_optional(db)
+		.await
+}
+
+pub async fn load_listings<'e, E>(db: E) -> Result<Vec<crate::models::listing::ListingDefinition>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
 	let rows = sqlx::query_as::<_, ListingRow>(
-		"SELECT id, name, slug, summary, description, publisher, category_slug, package_kind, repository_slug, visibility, tags, capabilities, install_count, average_rating, created_at, updated_at
-		 FROM marketplace_listings
+		"SELECT * FROM marketplace_listings
 		 ORDER BY install_count DESC, average_rating DESC, updated_at DESC",
 	)
 	.fetch_all(db)
@@ -63,10 +80,15 @@ pub async fn load_listings(db: &sqlx::PgPool) -> Result<Vec<crate::models::listi
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_versions(db: &sqlx::PgPool, listing_id: uuid::Uuid) -> Result<Vec<crate::models::package::PackageVersion>, sqlx::Error> {
+pub async fn load_versions<'e, E>(
+	db: E,
+	listing_id: uuid::Uuid,
+) -> Result<Vec<crate::models::package::PackageVersion>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
 	let rows = sqlx::query_as::<_, PackageVersionRow>(
-		"SELECT id, listing_id, version, changelog, dependency_mode, dependencies, manifest, published_at
-		 FROM marketplace_package_versions
+		"SELECT * FROM marketplace_package_versions
 		 WHERE listing_id = $1
 		 ORDER BY published_at DESC",
 	)
@@ -80,10 +102,15 @@ pub async fn load_versions(db: &sqlx::PgPool, listing_id: uuid::Uuid) -> Result<
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_reviews(db: &sqlx::PgPool, listing_id: uuid::Uuid) -> Result<Vec<crate::models::review::ListingReview>, sqlx::Error> {
+pub async fn load_reviews<'e, E>(
+	db: E,
+	listing_id: uuid::Uuid,
+) -> Result<Vec<crate::models::review::ListingReview>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
 	let rows = sqlx::query_as::<_, ReviewRow>(
-		"SELECT id, listing_id, author, rating, headline, body, recommended, created_at
-		 FROM marketplace_reviews
+		"SELECT * FROM marketplace_reviews
 		 WHERE listing_id = $1
 		 ORDER BY created_at DESC",
 	)
@@ -97,10 +124,12 @@ pub async fn load_reviews(db: &sqlx::PgPool, listing_id: uuid::Uuid) -> Result<V
 		.map_err(|cause| sqlx::Error::Decode(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, cause))))
 }
 
-pub async fn load_installs(db: &sqlx::PgPool) -> Result<Vec<crate::models::install::InstallRecord>, sqlx::Error> {
+pub async fn load_installs<'e, E>(db: E) -> Result<Vec<crate::models::install::InstallRecord>, sqlx::Error>
+where
+	E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
 	let rows = sqlx::query_as::<_, InstallRow>(
-		"SELECT id, listing_id, listing_name, version, workspace_name, status, dependency_plan, installed_at, ready_at
-		 FROM marketplace_installs
+		"SELECT * FROM marketplace_installs
 		 ORDER BY installed_at DESC",
 	)
 	.fetch_all(db)

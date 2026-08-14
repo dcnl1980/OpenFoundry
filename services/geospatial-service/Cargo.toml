@@ -23,3 +23,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
 geospatial-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

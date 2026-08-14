@@ -38,6 +38,7 @@ pub struct WorkflowDefinition {
 	pub name: String,
 	pub description: String,
 	pub owner_id: Uuid,
+	pub tenant_id: Uuid,
 	pub status: String,
 	pub trigger_type: String,
 	pub trigger_config: Value,

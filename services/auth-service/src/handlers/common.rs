@@ -1,7 +1,6 @@
 use auth_middleware::Claims;
 use axum::{Json, http::StatusCode, response::{IntoResponse, Response}};
 use serde_json::json;
-use sqlx::PgPool;
 use crate::domain::rbac;
 use crate::models::user::{User, UserResponse};
 
@@ -20,13 +19,16 @@ pub fn require_permission(claims: &Claims, resource: &str, action: &str) -> Resu
     }
 }
 
-pub async fn build_user_response(pool: &PgPool, user: User) -> Result<UserResponse, sqlx::Error> {
-    let access_bundle = rbac::get_user_access_bundle(pool, user.id).await.unwrap_or_default();
+pub async fn build_user_response(
+    conn: &mut sqlx::PgConnection,
+    user: User,
+) -> Result<UserResponse, sqlx::Error> {
+    let access_bundle = rbac::get_user_access_bundle(conn, user.id).await.unwrap_or_default();
     let mfa_enabled = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM user_mfa_totp WHERE user_id = $1 AND enabled = true)",
     )
     .bind(user.id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or(false);
 

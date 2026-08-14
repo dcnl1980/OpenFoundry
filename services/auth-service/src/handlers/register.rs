@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::handlers::tenant::begin_tenant_id;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -22,13 +23,14 @@ pub async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    // Check if email already exists
-    let existing = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)")
-        .bind(&body.email)
-        .fetch_one(&state.db)
-        .await;
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM openfoundry_lookup_user_by_email($1)",
+    )
+    .bind(&body.email)
+    .fetch_optional(&state.db)
+    .await;
 
-    if matches!(existing, Ok(true)) {
+    if matches!(existing, Ok(Some(_))) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "email already registered" })),
@@ -48,28 +50,46 @@ pub async fn register(
     };
 
     let user_id = Uuid::now_v7();
+    let tenant_id = user_id;
+    let mut tx = match begin_tenant_id(&state, tenant_id).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+
     let result = sqlx::query(
-          r#"INSERT INTO users (id, email, name, password_hash, is_active, auth_source)
-              VALUES ($1, $2, $3, $4, true, 'local')"#,
+        r#"INSERT INTO users (id, email, name, password_hash, is_active, auth_source, tenant_id)
+              VALUES ($1, $2, $3, $4, true, 'local', $5)"#,
     )
     .bind(user_id)
     .bind(&body.email)
     .bind(&body.name)
     .bind(&password_hash)
-    .execute(&state.db)
+    .bind(tenant_id)
+    .execute(&mut *tx)
     .await;
+
+    if result.is_ok() {
+        let _ = sqlx::query(
+            r#"INSERT INTO user_roles (user_id, role_id, tenant_id)
+               SELECT $1, id, $2 FROM roles WHERE name = 'viewer'
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await;
+    }
 
     match result {
         Ok(_) => {
-            // Assign default 'viewer' role
-            let _ = sqlx::query(
-                r#"INSERT INTO user_roles (user_id, role_id)
-                   SELECT $1, id FROM roles WHERE name = 'viewer'
-                   ON CONFLICT DO NOTHING"#,
-            )
-            .bind(user_id)
-            .execute(&state.db)
-            .await;
+            if let Err(e) = tx.commit().await {
+                tracing::error!("registration commit failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "registration failed" })),
+                )
+                    .into_response();
+            }
 
             tracing::info!(user_id = %user_id, email = %body.email, "user registered");
 

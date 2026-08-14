@@ -1,8 +1,9 @@
+use auth_middleware::layer::AuthUser;
 use axum::{extract::State, Json};
 
 use crate::{
 	domain::engine::{clustering, routing, spatial_query},
-	handlers::{bad_request, db_error, load_all_layers, not_found, ServiceResult},
+	handlers::{bad_request, db_error, load_all_layers, not_found, scoped_tx, ServiceResult},
 	models::spatial_index::{
 		ClusterRequest, ClusterResponse, RouteRequest, RouteResponse, SpatialOperation,
 		SpatialQueryRequest, SpatialQueryResponse,
@@ -12,6 +13,7 @@ use crate::{
 
 pub async fn query_features(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<SpatialQueryRequest>,
 ) -> ServiceResult<SpatialQueryResponse> {
 	if matches!(request.operation, SpatialOperation::Within | SpatialOperation::Intersects) && request.bounds.is_none() {
@@ -21,7 +23,11 @@ pub async fn query_features(
 		return Err(bad_request("point is required for nearest/buffer queries"));
 	}
 
-	let layers = load_all_layers(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let layers = load_all_layers(&mut tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	let layer = layers
 		.into_iter()
 		.find(|layer| layer.id == request.layer_id)
@@ -31,9 +37,14 @@ pub async fn query_features(
 
 pub async fn cluster_features(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<ClusterRequest>,
 ) -> ServiceResult<ClusterResponse> {
-	let layers = load_all_layers(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = scoped_tx(&state, &claims).await?;
+	let layers = load_all_layers(&mut tx)
+		.await
+		.map_err(|cause| db_error(&cause))?;
+	tx.commit().await.map_err(|cause| db_error(&cause))?;
 	let layer = layers
 		.into_iter()
 		.find(|layer| layer.id == request.layer_id)

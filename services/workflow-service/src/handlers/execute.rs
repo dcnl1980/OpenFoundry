@@ -13,14 +13,21 @@ use crate::{
 	models::{execution::StartRunRequest, execution::TriggerEventRequest, workflow::WorkflowDefinition},
 	AppState,
 };
+use auth_middleware::{begin_tenant_transaction, layer::AuthUser, DueWork};
+
+use super::tenant::begin_scope;
 
 pub async fn start_manual_run(
 	State(state): State<AppState>,
 	Path(workflow_id): Path<Uuid>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<StartRunRequest>,
 ) -> impl IntoResponse {
-	let Some(workflow) = (match load_workflow(&state, workflow_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let Some(workflow) = (match load_workflow(&mut tx, workflow_id).await {
 		Ok(workflow) => workflow,
 		Err(error) => {
 			tracing::error!("manual run lookup failed: {error}");
@@ -29,6 +36,10 @@ pub async fn start_manual_run(
 	}) else {
 		return StatusCode::NOT_FOUND.into_response();
 	};
+	if let Err(error) = tx.commit().await {
+		tracing::error!("manual run lookup commit failed: {error}");
+		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+	}
 
 	match executor::execute_workflow_run(
 		&state,
@@ -51,9 +62,13 @@ pub async fn start_manual_run(
 pub async fn trigger_event(
 	State(state): State<AppState>,
 	Path(event_name): Path<String>,
-	auth_middleware::layer::AuthUser(claims): auth_middleware::layer::AuthUser,
+	AuthUser(claims): AuthUser,
 	Json(body): Json<TriggerEventRequest>,
 ) -> impl IntoResponse {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
 	let workflows = sqlx::query_as::<_, WorkflowDefinition>(
 		r#"SELECT * FROM workflows
 		   WHERE status = 'active'
@@ -62,11 +77,15 @@ pub async fn trigger_event(
 		   ORDER BY updated_at DESC"#,
 	)
 	.bind(&event_name)
-	.fetch_all(&state.db)
+	.fetch_all(&mut *tx)
 	.await;
 
 	match workflows {
 		Ok(workflows) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("event workflow lookup commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+			}
 			let mut triggered = Vec::new();
 			for workflow in workflows {
 				let payload = json!({
@@ -107,7 +126,32 @@ pub async fn trigger_webhook(
 	headers: HeaderMap,
 	Json(body): Json<TriggerEventRequest>,
 ) -> impl IntoResponse {
-	let Some(workflow) = (match load_workflow(&state, workflow_id).await {
+	let resolved = sqlx::query_as::<_, DueWork>(
+		"SELECT id, tenant_id FROM openfoundry_webhook_workflow($1)",
+	)
+	.bind(workflow_id)
+	.fetch_optional(&state.db)
+	.await;
+
+	let Some(resolved) = (match resolved {
+		Ok(row) => row,
+		Err(error) => {
+			tracing::error!("webhook tenant lookup failed: {error}");
+			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+		}
+	}) else {
+		return StatusCode::NOT_FOUND.into_response();
+	};
+
+	let mut tx = match begin_tenant_transaction(&state.db, resolved.tenant_id).await {
+		Ok(tx) => tx,
+		Err(error) => {
+			tracing::error!("webhook tenant transaction failed: {error}");
+			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+		}
+	};
+
+	let Some(workflow) = (match load_workflow(&mut tx, workflow_id).await {
 		Ok(workflow) => workflow,
 		Err(error) => {
 			tracing::error!("webhook lookup failed: {error}");
@@ -133,6 +177,10 @@ pub async fn trigger_webhook(
 		if actual != expected_secret {
 			return StatusCode::UNAUTHORIZED.into_response();
 		}
+	}
+	if let Err(error) = tx.commit().await {
+		tracing::error!("webhook lookup commit failed: {error}");
+		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 	}
 
 	match executor::execute_workflow_run(
@@ -160,6 +208,7 @@ pub async fn trigger_webhook(
 }
 
 pub async fn run_due_cron_workflows(
+	_user: AuthUser,
 	State(state): State<AppState>,
 ) -> impl IntoResponse {
 	match executor::run_due_cron_workflows(&state).await {

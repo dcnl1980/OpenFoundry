@@ -11,6 +11,7 @@ pub struct Connection {
     pub config: serde_json::Value,
     pub status: String,
     pub owner_id: Uuid,
+    pub tenant_id: Uuid,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -1,10 +1,14 @@
+use auth_middleware::begin_tenant_transaction;
+use auth_middleware::layer::AuthUser;
 use axum::{extract::{Path, Query, State}, Json};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
+use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
 	domain::{alerting, collector, immutable_log},
-	handlers::{bad_request, db_error, internal_error, load_event_row, load_events, load_policies, ServiceResult},
+	handlers::{bad_request, db_error, internal_error, load_event_row, load_events, load_policies, tenant::begin_scope, ServiceResult},
 	models::{
 		audit_event::{AppendAuditEventRequest, AuditEvent, AuditOverview, EventListResponse},
 		data_classification::AnomalyAlert,
@@ -20,9 +24,13 @@ pub struct EventQuery {
 	pub classification: Option<String>,
 }
 
-pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<AuditOverview> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
-	let policies = load_policies(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn get_overview(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<AuditOverview> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
+	let policies = load_policies(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	let anomalies = alerting::detect_anomalies(&events);
 	let collectors = collector::collector_catalog(&events);
 
@@ -40,8 +48,10 @@ pub async fn get_overview(State(state): State<AppState>) -> ServiceResult<AuditO
 pub async fn list_events(
 	Query(query): Query<EventQuery>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<EventListResponse> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	let items = events
 		.into_iter()
 		.filter(|event| query.source_service.as_ref().map(|value| value == &event.source_service).unwrap_or(true))
@@ -50,15 +60,17 @@ pub async fn list_events(
 		.collect::<Vec<_>>();
 	Ok(Json(EventListResponse {
 		items,
-		anomalies: alerting::detect_anomalies(&load_events(&state.db).await.map_err(|cause| db_error(&cause))?),
+		anomalies: alerting::detect_anomalies(&load_events(&mut tx).await.map_err(|cause| db_error(&cause))?),
 	}))
 }
 
 pub async fn get_event(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 ) -> ServiceResult<AuditEvent> {
-	let row = load_event_row(&state.db, id)
+	let mut tx = begin_scope(&state, &claims).await?;
+	let row = load_event_row(&mut tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| crate::handlers::not_found("audit event not found"))?;
@@ -68,30 +80,46 @@ pub async fn get_event(
 
 pub async fn append_event(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(mut request): Json<AppendAuditEventRequest>,
 ) -> ServiceResult<AuditEvent> {
 	if request.action.trim().is_empty() {
 		return Err(bad_request("action is required"));
 	}
 
-	let event = persist_event(&state.db, &mut request)
+	let event = persist_event(&state.db, claims.tenant_scope_id(), &mut request)
 		.await
 		.map_err(|cause| internal_error(cause))?;
 	Ok(Json(event))
 }
 
+pub fn tenant_id_from_collected_event(request: &AppendAuditEventRequest) -> Option<Uuid> {
+	if let Some(tenant_id) = request.tenant_id {
+		return Some(tenant_id);
+	}
+	match request.metadata.get("tenant_id") {
+		Some(Value::String(value)) => Uuid::parse_str(value).ok(),
+		_ => None,
+	}
+}
+
 pub async fn persist_event(
 	db: &sqlx::PgPool,
+	tenant_id: Uuid,
 	request: &mut AppendAuditEventRequest,
 ) -> Result<AuditEvent, String> {
 	if request.action.trim().is_empty() {
 		return Err("action is required".to_string());
 	}
 
+	let mut tx = begin_tenant_transaction(db, tenant_id)
+		.await
+		.map_err(|cause| format!("failed to open audit tenant scope: {cause}"))?;
+
 	let latest = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
 		"SELECT MAX(sequence) AS sequence, (ARRAY_AGG(entry_hash ORDER BY sequence DESC))[1] AS entry_hash FROM audit_events",
 	)
-	.fetch_one(db)
+	.fetch_one(&mut *tx)
 	.await
 	.map_err(|cause| format!("failed to load latest audit sequence: {cause}"))?;
 
@@ -105,8 +133,8 @@ pub async fn persist_event(
 	let labels = serde_json::to_value(&request.labels).map_err(|cause| cause.to_string())?;
 
 	sqlx::query(
-		"INSERT INTO audit_events (id, sequence, previous_hash, entry_hash, source_service, channel, actor, action, resource_type, resource_id, status, severity, classification, subject_id, ip_address, location, metadata, labels, retention_until, occurred_at, ingested_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21)",
+		"INSERT INTO audit_events (id, sequence, previous_hash, entry_hash, source_service, channel, actor, action, resource_type, resource_id, status, severity, classification, subject_id, ip_address, location, metadata, labels, retention_until, occurred_at, ingested_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22)",
 	)
 	.bind(id)
 	.bind(sequence)
@@ -129,25 +157,37 @@ pub async fn persist_event(
 	.bind(now + Duration::days(request.retention_days as i64))
 	.bind(now)
 	.bind(now)
-	.execute(db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| format!("failed to insert audit event: {cause}"))?;
 
-	let row = load_event_row(db, id)
+	let row = load_event_row(&mut tx, id)
 		.await
 		.map_err(|cause| format!("failed to reload audit event: {cause}"))?
 		.ok_or_else(|| "created audit event could not be reloaded".to_string())?;
+	tx.commit()
+		.await
+		.map_err(|cause| format!("failed to commit audit event: {cause}"))?;
 	let mut event = AuditEvent::try_from(row).map_err(|cause| cause.to_string())?;
 	event.labels = immutable_log::label_event(&event);
 	Ok(event)
 }
 
-pub async fn list_collectors(State(state): State<AppState>) -> ServiceResult<Vec<CollectorStatus>> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_collectors(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<Vec<CollectorStatus>> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(collector::collector_catalog(&events)))
 }
 
-pub async fn list_anomalies(State(state): State<AppState>) -> ServiceResult<Vec<AnomalyAlert>> {
-	let events = load_events(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_anomalies(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<Vec<AnomalyAlert>> {
+	let mut tx = begin_scope(&state, &claims).await?;
+	let events = load_events(&mut tx).await.map_err(|cause| db_error(&cause))?;
 	Ok(Json(alerting::detect_anomalies(&events)))
 }

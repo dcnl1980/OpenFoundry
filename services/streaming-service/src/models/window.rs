@@ -61,6 +61,8 @@ pub struct WindowRow {
 	pub allowed_lateness_seconds: i32,
 	pub aggregation_keys: SqlJson<Vec<String>>,
 	pub measure_fields: SqlJson<Vec<String>>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
 }

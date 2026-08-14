@@ -1,9 +1,11 @@
 use std::str::FromStr;
 
+use auth_middleware::{begin_tenant_transaction, fetch_due_work};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -23,14 +25,30 @@ pub async fn execute_workflow_run(
     started_by: Option<Uuid>,
     context: Value,
 ) -> Result<WorkflowRun, String> {
+    let mut tx = begin_tenant_transaction(&state.db, workflow.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let run = execute_workflow_run_in_tx(state, &mut tx, workflow, trigger_type, started_by, context).await?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(run)
+}
+
+async fn execute_workflow_run_in_tx(
+    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
+    workflow: &WorkflowDefinition,
+    trigger_type: &str,
+    started_by: Option<Uuid>,
+    context: Value,
+) -> Result<WorkflowRun, String> {
     let steps = workflow.parsed_steps()?;
     let Some(first_step) = steps.first() else {
         return Err("workflow must define at least one step".to_string());
     };
 
     let run = sqlx::query_as::<_, WorkflowRun>(
-        r#"INSERT INTO workflow_runs (id, workflow_id, trigger_type, status, started_by, current_step_id, context)
-           VALUES ($1, $2, $3, 'running', $4, $5, $6)
+        r#"INSERT INTO workflow_runs (id, workflow_id, trigger_type, status, started_by, current_step_id, context, tenant_id)
+           VALUES ($1, $2, $3, 'running', $4, $5, $6, $7)
            RETURNING *"#,
     )
     .bind(Uuid::now_v7())
@@ -39,12 +57,13 @@ pub async fn execute_workflow_run(
     .bind(started_by)
     .bind(&first_step.id)
     .bind(&context)
-    .fetch_one(&state.db)
+    .bind(workflow.tenant_id)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
 
-    mark_workflow_triggered(state, workflow).await?;
-    continue_run(state, workflow, run).await
+    mark_workflow_triggered(tx, workflow).await?;
+    continue_run(state, tx, workflow, run).await
 }
 
 pub async fn continue_after_approval(
@@ -54,9 +73,12 @@ pub async fn continue_after_approval(
     decision: &str,
     step: &WorkflowStep,
 ) -> Result<WorkflowRun, String> {
+    let mut tx = begin_tenant_transaction(&state.db, workflow.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let next = approval_next_step(step, decision, &run.context);
 
-    if let Some(next_step_id) = next {
+    let result = if let Some(next_step_id) = next {
         run = sqlx::query_as::<_, WorkflowRun>(
             r#"UPDATE workflow_runs
                SET status = 'running', current_step_id = $2, context = $3, error_message = NULL
@@ -66,31 +88,43 @@ pub async fn continue_after_approval(
         .bind(run.id)
         .bind(next_step_id)
         .bind(&run.context)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|error| error.to_string())?;
 
-        continue_run(state, workflow, run).await
+        continue_run(state, &mut tx, workflow, run).await
     } else {
-        complete_run(state, run.id, &run.context).await
-    }
+        complete_run(&mut tx, run.id, &run.context).await
+    };
+    let run = result?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(run)
 }
 
 pub async fn run_due_cron_workflows(state: &AppState) -> Result<usize, String> {
-    let workflows = sqlx::query_as::<_, WorkflowDefinition>(
-        r#"SELECT * FROM workflows
-           WHERE status = 'active'
-             AND trigger_type = 'cron'
-             AND next_run_at IS NOT NULL
-             AND next_run_at <= NOW()
-           ORDER BY next_run_at ASC"#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|error| error.to_string())?;
+    let due = fetch_due_work(&state.db, "SELECT id, tenant_id FROM openfoundry_due_workflows()")
+        .await
+        .map_err(|error| error.to_string())?;
 
     let mut triggered = 0usize;
-    for workflow in workflows {
+    for item in due {
+        let workflow = {
+            let mut tx = begin_tenant_transaction(&state.db, item.tenant_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let workflow = sqlx::query_as::<_, WorkflowDefinition>("SELECT * FROM workflows WHERE id = $1")
+                .bind(item.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| error.to_string())?;
+            tx.commit().await.map_err(|error| error.to_string())?;
+            workflow
+        };
+
+        let Some(workflow) = workflow else {
+            continue;
+        };
+
         let context = json!({
             "trigger": {
                 "type": "cron",
@@ -149,6 +183,7 @@ pub async fn send_workflow_notification(
 
 async fn continue_run(
     state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     workflow: &WorkflowDefinition,
     mut run: WorkflowRun,
 ) -> Result<WorkflowRun, String> {
@@ -156,11 +191,11 @@ async fn continue_run(
 
     loop {
         let Some(step_id) = run.current_step_id.clone() else {
-            return complete_run(state, run.id, &run.context).await;
+            return complete_run(tx, run.id, &run.context).await;
         };
 
         let Some(step) = steps.iter().find(|candidate| candidate.id == step_id) else {
-            return fail_run(state, run.id, &run.context, format!("step '{step_id}' not found")).await;
+            return fail_run(tx, run.id, &run.context, format!("step '{step_id}' not found")).await;
         };
 
         match step.step_type.as_str() {
@@ -168,9 +203,9 @@ async fn continue_run(
                 let mut context = run.context.clone();
                 apply_action(step, &mut context);
                 if let Some(next_step_id) = branching::resolve_next_step(step, &context) {
-                    run = update_running_step(state, run.id, Some(next_step_id), &context).await?;
+                    run = update_running_step(tx, run.id, Some(next_step_id), &context).await?;
                 } else {
-                    return complete_run(state, run.id, &context).await;
+                    return complete_run(tx, run.id, &context).await;
                 }
             }
             "notification" => {
@@ -206,9 +241,9 @@ async fn continue_run(
                 .await;
 
                 if let Some(next_step_id) = branching::resolve_next_step(step, &run.context) {
-                    run = update_running_step(state, run.id, Some(next_step_id), &run.context).await?;
+                    run = update_running_step(tx, run.id, Some(next_step_id), &run.context).await?;
                 } else {
-                    return complete_run(state, run.id, &run.context).await;
+                    return complete_run(tx, run.id, &run.context).await;
                 }
             }
             "approval" => {
@@ -234,16 +269,16 @@ async fn continue_run(
                 )
                 .bind(run.id)
                 .bind(&step.id)
-                .fetch_optional(&state.db)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|error| error.to_string())?;
 
                 if existing.is_none() {
                     let _ = sqlx::query(
                         r#"INSERT INTO workflow_approvals (
-                               id, workflow_id, workflow_run_id, step_id, title, instructions, assigned_to, payload
+                               id, workflow_id, workflow_run_id, step_id, title, instructions, assigned_to, payload, tenant_id
                            )
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
                     )
                     .bind(Uuid::now_v7())
                     .bind(workflow.id)
@@ -253,7 +288,8 @@ async fn continue_run(
                     .bind(&instructions)
                     .bind(assigned_to)
                     .bind(&run.context)
-                    .execute(&state.db)
+                    .bind(workflow.tenant_id)
+                    .execute(&mut **tx)
                     .await
                     .map_err(|error| error.to_string())?;
 
@@ -286,7 +322,7 @@ async fn continue_run(
                 .bind(run.id)
                 .bind(&step.id)
                 .bind(&run.context)
-                .fetch_one(&state.db)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(|error| error.to_string())?;
 
@@ -294,7 +330,7 @@ async fn continue_run(
             }
             other => {
                 return fail_run(
-                    state,
+                    tx,
                     run.id,
                     &run.context,
                     format!("unsupported step type '{other}'"),
@@ -306,7 +342,7 @@ async fn continue_run(
 }
 
 async fn update_running_step(
-    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     next_step_id: Option<String>,
     context: &Value,
@@ -320,12 +356,16 @@ async fn update_running_step(
     .bind(run_id)
     .bind(next_step_id)
     .bind(context)
-    .fetch_one(&state.db)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())
 }
 
-async fn complete_run(state: &AppState, run_id: Uuid, context: &Value) -> Result<WorkflowRun, String> {
+async fn complete_run(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    context: &Value,
+) -> Result<WorkflowRun, String> {
     sqlx::query_as::<_, WorkflowRun>(
         r#"UPDATE workflow_runs
            SET status = 'completed', current_step_id = NULL, context = $2, finished_at = NOW(), error_message = NULL
@@ -334,13 +374,13 @@ async fn complete_run(state: &AppState, run_id: Uuid, context: &Value) -> Result
     )
     .bind(run_id)
     .bind(context)
-    .fetch_one(&state.db)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())
 }
 
 async fn fail_run(
-    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     context: &Value,
     error_message: String,
@@ -354,13 +394,13 @@ async fn fail_run(
     .bind(run_id)
     .bind(context)
     .bind(error_message)
-    .fetch_one(&state.db)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())
 }
 
 async fn mark_workflow_triggered(
-    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
     workflow: &WorkflowDefinition,
 ) -> Result<(), String> {
     let next_run_at = compute_next_run_at(workflow);
@@ -371,7 +411,7 @@ async fn mark_workflow_triggered(
     )
     .bind(workflow.id)
     .bind(next_run_at)
-    .execute(&state.db)
+    .execute(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
 

@@ -37,6 +37,8 @@ pub struct BranchRow {
 	pub ahead_by: i32,
 	pub pending_reviews: i32,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: Uuid,
 }
 
 impl TryFrom<BranchRow> for BranchDefinition {

@@ -9,6 +9,7 @@ use crate::models::group::Group;
 use crate::models::role::Role;
 
 use super::common::{json_error, require_permission};
+use super::tenant::begin_scope;
 
 #[derive(Debug, Serialize)]
 pub struct GroupResponse {
@@ -49,16 +50,20 @@ pub async fn list_groups(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query_as::<_, Group>(
         "SELECT id, name, description, created_at FROM groups ORDER BY name",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     {
         Ok(groups) => {
             let mut responses = Vec::with_capacity(groups.len());
             for group in groups {
-                match build_group_response(&state.db, group).await {
+                match build_group_response(&mut tx, group).await {
                     Ok(response) => responses.push(response),
                     Err(e) => {
                         tracing::error!("failed to build group response: {e}");
@@ -84,18 +89,23 @@ pub async fn create_group(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     let group_id = Uuid::now_v7();
     match sqlx::query(
-        "INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)",
+        "INSERT INTO groups (id, name, description, tenant_id) VALUES ($1, $2, $3, $4)",
     )
     .bind(group_id)
     .bind(&body.name)
     .bind(&body.description)
-    .execute(&state.db)
+    .bind(claims.tenant_scope_id())
+    .execute(&mut *tx)
     .await
     {
         Ok(_) => {
-            if let Err(e) = replace_group_roles(&state.db, group_id, &body.role_ids).await {
+            if let Err(e) = replace_group_roles(&mut tx, group_id, &body.role_ids).await {
                 tracing::error!("failed to assign group roles: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -104,10 +114,10 @@ pub async fn create_group(
                 "SELECT id, name, description, created_at FROM groups WHERE id = $1",
             )
             .bind(group_id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await
             {
-                Ok(group) => match build_group_response(&state.db, group).await {
+                Ok(group) => match build_group_response(&mut tx, group).await {
                     Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
                     Err(e) => {
                         tracing::error!("failed to build created group response: {e}");
@@ -137,15 +147,19 @@ pub async fn update_group(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("UPDATE groups SET description = $2 WHERE id = $1")
         .bind(group_id)
         .bind(body.description)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
         Ok(record) if record.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
-            if let Err(e) = replace_group_roles(&state.db, group_id, &body.role_ids).await {
+            if let Err(e) = replace_group_roles(&mut tx, group_id, &body.role_ids).await {
                 tracing::error!("failed to replace group roles: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -154,10 +168,10 @@ pub async fn update_group(
                 "SELECT id, name, description, created_at FROM groups WHERE id = $1",
             )
             .bind(group_id)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await
             {
-                Ok(group) => match build_group_response(&state.db, group).await {
+                Ok(group) => match build_group_response(&mut tx, group).await {
                     Ok(response) => Json(response).into_response(),
                     Err(e) => {
                         tracing::error!("failed to build updated group response: {e}");
@@ -187,12 +201,17 @@ pub async fn add_user_to_group(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query(
-        "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        "INSERT INTO group_members (group_id, user_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
     .bind(body.group_id)
     .bind(user_id)
-    .execute(&state.db)
+    .bind(claims.tenant_scope_id())
+    .execute(&mut *tx)
     .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -212,10 +231,14 @@ pub async fn remove_user_from_group(
         return response;
     }
 
+    let mut tx = match begin_scope(&state, &claims).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
     match sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND user_id = $2")
         .bind(group_id)
         .bind(user_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -226,7 +249,10 @@ pub async fn remove_user_from_group(
     }
 }
 
-async fn build_group_response(pool: &sqlx::PgPool, group: Group) -> Result<GroupResponse, sqlx::Error> {
+async fn build_group_response(
+    conn: &mut sqlx::PgConnection,
+    group: Group,
+) -> Result<GroupResponse, sqlx::Error> {
     let roles = sqlx::query_as::<_, Role>(
         r#"SELECT r.id, r.name, r.description, r.created_at
            FROM roles r
@@ -235,14 +261,14 @@ async fn build_group_response(pool: &sqlx::PgPool, group: Group) -> Result<Group
            ORDER BY r.name"#,
     )
     .bind(group.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let member_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT FROM group_members WHERE group_id = $1",
     )
     .bind(group.id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or(0);
 
@@ -258,23 +284,22 @@ async fn build_group_response(pool: &sqlx::PgPool, group: Group) -> Result<Group
 }
 
 async fn replace_group_roles(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     group_id: Uuid,
     role_ids: &[Uuid],
 ) -> Result<(), sqlx::Error> {
-    let mut transaction = pool.begin().await?;
     sqlx::query("DELETE FROM group_roles WHERE group_id = $1")
         .bind(group_id)
-        .execute(&mut *transaction)
+        .execute(&mut *conn)
         .await?;
 
     for role_id in role_ids {
         sqlx::query("INSERT INTO group_roles (group_id, role_id) VALUES ($1, $2)")
             .bind(group_id)
             .bind(role_id)
-            .execute(&mut *transaction)
+            .execute(&mut *conn)
             .await?;
     }
 
-    transaction.commit().await
+    Ok(())
 }

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -43,22 +43,27 @@ pub struct ColumnLineageEdge {
 }
 
 /// Get lineage graph rooted at a specific dataset (upstream + downstream).
-pub async fn get_lineage_graph(db: &PgPool, dataset_id: Uuid) -> Result<LineageGraph, sqlx::Error> {
+pub async fn get_lineage_graph(
+    tx: &mut Transaction<'_, Postgres>,
+    dataset_id: Uuid,
+) -> Result<LineageGraph, sqlx::Error> {
     let edges = sqlx::query_as::<_, LineageEdge>(
         r#"SELECT * FROM lineage_edges
            WHERE source_dataset_id = $1 OR target_dataset_id = $1"#,
     )
     .bind(dataset_id)
-    .fetch_all(db)
+    .fetch_all(&mut **tx)
     .await?;
 
     Ok(build_graph(&edges))
 }
 
 /// Get the full lineage graph for all datasets.
-pub async fn get_full_lineage_graph(db: &PgPool) -> Result<LineageGraph, sqlx::Error> {
+pub async fn get_full_lineage_graph(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<LineageGraph, sqlx::Error> {
     let edges = sqlx::query_as::<_, LineageEdge>("SELECT * FROM lineage_edges")
-        .fetch_all(db)
+        .fetch_all(&mut **tx)
         .await?;
 
     Ok(build_graph(&edges))
@@ -66,15 +71,16 @@ pub async fn get_full_lineage_graph(db: &PgPool) -> Result<LineageGraph, sqlx::E
 
 /// Record a lineage edge between datasets.
 pub async fn record_lineage(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     source_dataset_id: Uuid,
     target_dataset_id: Uuid,
     pipeline_id: Option<Uuid>,
     node_id: Option<&str>,
+    tenant_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"INSERT INTO lineage_edges (id, source_dataset_id, target_dataset_id, pipeline_id, node_id)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO lineage_edges (id, source_dataset_id, target_dataset_id, pipeline_id, node_id, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT DO NOTHING"#,
     )
     .bind(Uuid::now_v7())
@@ -82,13 +88,14 @@ pub async fn record_lineage(
     .bind(target_dataset_id)
     .bind(pipeline_id)
     .bind(node_id)
-    .execute(db)
+    .bind(tenant_id)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 pub async fn get_dataset_column_lineage(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     dataset_id: Uuid,
 ) -> Result<Vec<ColumnLineageEdge>, sqlx::Error> {
     sqlx::query_as::<_, ColumnLineageEdge>(
@@ -97,24 +104,25 @@ pub async fn get_dataset_column_lineage(
            ORDER BY created_at DESC"#,
     )
     .bind(dataset_id)
-    .fetch_all(db)
+    .fetch_all(&mut **tx)
     .await
 }
 
 pub async fn record_column_lineage(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     source_dataset_id: Uuid,
     source_column: &str,
     target_dataset_id: Uuid,
     target_column: &str,
     pipeline_id: Option<Uuid>,
     node_id: Option<&str>,
+    tenant_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO column_lineage_edges (
-               id, source_dataset_id, source_column, target_dataset_id, target_column, pipeline_id, node_id
+               id, source_dataset_id, source_column, target_dataset_id, target_column, pipeline_id, node_id, tenant_id
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT DO NOTHING"#,
     )
     .bind(Uuid::now_v7())
@@ -124,7 +132,8 @@ pub async fn record_column_lineage(
     .bind(target_column)
     .bind(pipeline_id)
     .bind(node_id)
-    .execute(db)
+    .bind(tenant_id)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }

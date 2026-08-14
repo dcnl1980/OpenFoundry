@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub struct SyncJob {
     pub id: Uuid,
     pub connection_id: Uuid,
+    pub tenant_id: Uuid,
     pub target_dataset_id: Option<Uuid>,
     pub table_name: String,
     pub status: String,

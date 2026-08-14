@@ -111,7 +111,14 @@ impl TenantContext {
 	pub fn clamp_request_body_bytes(&self, requested: usize) -> usize {
 		requested.min(self.quotas.max_request_body_bytes.max(1))
 	}
+
+	/// UUID used for database tenant isolation (`org_id` or subject).
+	pub fn isolation_id(&self) -> Uuid {
+		self.tenant_id.unwrap_or_else(|| {
+			Uuid::parse_str(&self.scope_id).expect("tenant scope_id is always a UUID")
+		})
 	}
+}
 
 fn apply_quota_overrides(quotas: &mut TenantQuotaPolicy, overrides: Option<&Value>) {
 	let Some(overrides) = overrides.and_then(Value::as_object) else {

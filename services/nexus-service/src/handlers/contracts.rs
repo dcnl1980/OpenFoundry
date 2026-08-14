@@ -1,26 +1,37 @@
 use axum::{extract::{Path, State}, Json};
 use chrono::Utc;
+use auth_middleware::layer::AuthUser;
 
 use crate::{
-	handlers::{bad_request, db_error, internal_error, load_contract_row, load_contracts, load_peers, not_found, ServiceResult},
+	handlers::{
+		bad_request, commit_scope, db_error, internal_error, load_contract_row, load_contracts, load_peers, not_found,
+		open_scope, ServiceResult,
+	},
 	models::{contract::{CreateContractRequest, SharingContract, UpdateContractRequest}, ListResponse},
 	AppState,
 };
 
-pub async fn list_contracts(State(state): State<AppState>) -> ServiceResult<ListResponse<SharingContract>> {
-	let items = load_contracts(&state.db).await.map_err(|cause| db_error(&cause))?;
+pub async fn list_contracts(
+	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
+) -> ServiceResult<ListResponse<SharingContract>> {
+	let mut tx = open_scope(&state, &claims).await?;
+	let items = load_contracts(&mut *tx).await.map_err(|cause| db_error(&cause))?;
+	commit_scope(tx).await?;
 	Ok(Json(ListResponse { items }))
 }
 
 pub async fn create_contract(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<CreateContractRequest>,
 ) -> ServiceResult<SharingContract> {
 	if request.name.trim().is_empty() {
 		return Err(bad_request("contract name is required"));
 	}
 
-	let peers = load_peers(&state.db).await.map_err(|cause| db_error(&cause))?;
+	let mut tx = open_scope(&state, &claims).await?;
+	let peers = load_peers(&mut *tx).await.map_err(|cause| db_error(&cause))?;
 	if !peers.iter().any(|peer| peer.id == request.peer_id) {
 		return Err(bad_request("peer does not exist"));
 	}
@@ -30,10 +41,11 @@ pub async fn create_contract(
 	let allowed_purposes = serde_json::to_value(&request.allowed_purposes).map_err(|cause| internal_error(cause.to_string()))?;
 	let data_classes = serde_json::to_value(&request.data_classes).map_err(|cause| internal_error(cause.to_string()))?;
 	let signed_at = if request.status == "active" { Some(now) } else { None };
+	let tenant_id = claims.tenant_scope_id();
 
 	sqlx::query(
-		"INSERT INTO nexus_contracts (id, peer_id, name, description, dataset_locator, allowed_purposes, data_classes, residency_region, query_template, max_rows_per_query, replication_mode, encryption_profile, retention_days, status, signed_at, expires_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+		"INSERT INTO nexus_contracts (id, peer_id, name, description, dataset_locator, allowed_purposes, data_classes, residency_region, query_template, max_rows_per_query, replication_mode, encryption_profile, retention_days, status, signed_at, expires_at, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
 	)
 	.bind(id)
 	.bind(request.peer_id)
@@ -53,14 +65,16 @@ pub async fn create_contract(
 	.bind(request.expires_at)
 	.bind(now)
 	.bind(now)
-	.execute(&state.db)
+	.bind(tenant_id)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_contract_row(&state.db, id)
+	let row = load_contract_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("created contract could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let contract = SharingContract::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(contract))
 }
@@ -68,9 +82,11 @@ pub async fn create_contract(
 pub async fn update_contract(
 	Path(id): Path<uuid::Uuid>,
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Json(request): Json<UpdateContractRequest>,
 ) -> ServiceResult<SharingContract> {
-	let current = load_contract_row(&state.db, id)
+	let mut tx = open_scope(&state, &claims).await?;
+	let current = load_contract_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| not_found("contract not found"))?;
@@ -122,14 +138,15 @@ pub async fn update_contract(
 	.bind(signed_at)
 	.bind(request.expires_at.unwrap_or(current.expires_at))
 	.bind(now)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await
 	.map_err(|cause| db_error(&cause))?;
 
-	let row = load_contract_row(&state.db, id)
+	let row = load_contract_row(&mut *tx, id)
 		.await
 		.map_err(|cause| db_error(&cause))?
 		.ok_or_else(|| internal_error("updated contract could not be reloaded"))?;
+	commit_scope(tx).await?;
 	let contract = SharingContract::try_from(row).map_err(|cause| internal_error(cause.to_string()))?;
 	Ok(Json(contract))
 }

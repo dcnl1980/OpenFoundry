@@ -4,7 +4,10 @@ use axum::{
 	response::IntoResponse,
 	Json,
 };
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
+
+use auth_middleware::layer::AuthUser;
 
 use crate::{
 	AppState,
@@ -15,12 +18,19 @@ use crate::{
 	},
 };
 
+use super::tenant::begin_scope;
+
 /// GET /api/v1/datasets/:id/quality
 pub async fn get_dataset_quality(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(dataset_id): Path<Uuid>,
 ) -> impl IntoResponse {
-	let dataset = match load_dataset(&state, dataset_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let dataset = match load_dataset_tx(&mut tx, dataset_id).await {
 		Ok(Some(dataset)) => dataset,
 		Ok(None) => return StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
@@ -28,8 +38,12 @@ pub async fn get_dataset_quality(
 			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 		}
 	};
+	if let Err(error) = tx.commit().await {
+		tracing::error!("get dataset quality commit failed: {error}");
+		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+	}
 
-	match profiler::fetch_dataset_quality(&state, dataset.id).await {
+	match profiler::fetch_dataset_quality(&state, &dataset).await {
 		Ok(response) => Json(response).into_response(),
 		Err(error) => {
 			tracing::error!("get dataset quality failed: {error}");
@@ -41,9 +55,14 @@ pub async fn get_dataset_quality(
 /// POST /api/v1/datasets/:id/quality/profile
 pub async fn refresh_dataset_quality(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(dataset_id): Path<Uuid>,
 ) -> impl IntoResponse {
-	let dataset = match load_dataset(&state, dataset_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let dataset = match load_dataset_tx(&mut tx, dataset_id).await {
 		Ok(Some(dataset)) => dataset,
 		Ok(None) => return StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
@@ -51,6 +70,10 @@ pub async fn refresh_dataset_quality(
 			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 		}
 	};
+	if let Err(error) = tx.commit().await {
+		tracing::error!("refresh dataset quality commit failed: {error}");
+		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+	}
 
 	if !profiler::dataset_has_uploaded_data(&state, &dataset).await {
 		return (
@@ -76,10 +99,15 @@ pub async fn refresh_dataset_quality(
 /// POST /api/v1/datasets/:id/quality/rules
 pub async fn create_quality_rule(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path(dataset_id): Path<Uuid>,
 	Json(body): Json<CreateQualityRuleRequest>,
 ) -> impl IntoResponse {
-	let dataset = match load_dataset(&state, dataset_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let dataset = match load_dataset_tx(&mut tx, dataset_id).await {
 		Ok(Some(dataset)) => dataset,
 		Ok(None) => return StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
@@ -100,17 +128,23 @@ pub async fn create_quality_rule(
 	.bind(body.severity.as_deref().unwrap_or("medium"))
 	.bind(&body.config)
 	.bind(body.enabled.unwrap_or(true))
-	.fetch_one(&state.db)
+	.fetch_one(&mut *tx)
 	.await;
 
 	match result {
-		Ok(_) => match refresh_if_possible(&state, &dataset).await {
-			Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
-			Err(error) => {
-				tracing::error!("create quality rule refresh failed: {error}");
-				StatusCode::INTERNAL_SERVER_ERROR.into_response()
+		Ok(_) => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("create quality rule commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 			}
-		},
+			match refresh_if_possible(&state, &dataset).await {
+				Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+				Err(error) => {
+					tracing::error!("create quality rule refresh failed: {error}");
+					StatusCode::INTERNAL_SERVER_ERROR.into_response()
+				}
+			}
+		}
 		Err(error) => {
 			tracing::error!("create quality rule failed: {error}");
 			StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -121,10 +155,15 @@ pub async fn create_quality_rule(
 /// PATCH /api/v1/datasets/:id/quality/rules/:rule_id
 pub async fn update_quality_rule(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path((dataset_id, rule_id)): Path<(Uuid, Uuid)>,
 	Json(body): Json<UpdateQualityRuleRequest>,
 ) -> impl IntoResponse {
-	let dataset = match load_dataset(&state, dataset_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let dataset = match load_dataset_tx(&mut tx, dataset_id).await {
 		Ok(Some(dataset)) => dataset,
 		Ok(None) => return StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
@@ -148,17 +187,23 @@ pub async fn update_quality_rule(
 	.bind(&body.severity)
 	.bind(body.enabled)
 	.bind(&body.config)
-	.execute(&state.db)
+	.execute(&mut *tx)
 	.await;
 
 	match result {
-		Ok(result) if result.rows_affected() > 0 => match refresh_if_possible(&state, &dataset).await {
-			Ok(response) => Json(response).into_response(),
-			Err(error) => {
-				tracing::error!("update quality rule refresh failed: {error}");
-				StatusCode::INTERNAL_SERVER_ERROR.into_response()
+		Ok(result) if result.rows_affected() > 0 => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("update quality rule commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 			}
-		},
+			match refresh_if_possible(&state, &dataset).await {
+				Ok(response) => Json(response).into_response(),
+				Err(error) => {
+					tracing::error!("update quality rule refresh failed: {error}");
+					StatusCode::INTERNAL_SERVER_ERROR.into_response()
+				}
+			}
+		}
 		Ok(_) => StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
 			tracing::error!("update quality rule failed: {error}");
@@ -170,9 +215,14 @@ pub async fn update_quality_rule(
 /// DELETE /api/v1/datasets/:id/quality/rules/:rule_id
 pub async fn delete_quality_rule(
 	State(state): State<AppState>,
+	AuthUser(claims): AuthUser,
 	Path((dataset_id, rule_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-	let dataset = match load_dataset(&state, dataset_id).await {
+	let mut tx = match begin_scope(&state, &claims).await {
+		Ok(tx) => tx,
+		Err(response) => return response,
+	};
+	let dataset = match load_dataset_tx(&mut tx, dataset_id).await {
 		Ok(Some(dataset)) => dataset,
 		Ok(None) => return StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
@@ -184,17 +234,23 @@ pub async fn delete_quality_rule(
 	let result = sqlx::query("DELETE FROM dataset_quality_rules WHERE dataset_id = $1 AND id = $2")
 		.bind(dataset_id)
 		.bind(rule_id)
-		.execute(&state.db)
+		.execute(&mut *tx)
 		.await;
 
 	match result {
-		Ok(result) if result.rows_affected() > 0 => match refresh_if_possible(&state, &dataset).await {
-			Ok(response) => Json(response).into_response(),
-			Err(error) => {
-				tracing::error!("delete quality rule refresh failed: {error}");
-				StatusCode::INTERNAL_SERVER_ERROR.into_response()
+		Ok(result) if result.rows_affected() > 0 => {
+			if let Err(error) = tx.commit().await {
+				tracing::error!("delete quality rule commit failed: {error}");
+				return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 			}
-		},
+			match refresh_if_possible(&state, &dataset).await {
+				Ok(response) => Json(response).into_response(),
+				Err(error) => {
+					tracing::error!("delete quality rule refresh failed: {error}");
+					StatusCode::INTERNAL_SERVER_ERROR.into_response()
+				}
+			}
+		}
 		Ok(_) => StatusCode::NOT_FOUND.into_response(),
 		Err(error) => {
 			tracing::error!("delete quality rule failed: {error}");
@@ -210,16 +266,16 @@ async fn refresh_if_possible(
 	if profiler::dataset_has_uploaded_data(state, dataset).await {
 		profiler::refresh_dataset_quality(state, dataset, None).await
 	} else {
-		profiler::fetch_dataset_quality(state, dataset.id).await
+		profiler::fetch_dataset_quality(state, dataset).await
 	}
 }
 
-async fn load_dataset(
-	state: &AppState,
+async fn load_dataset_tx(
+	tx: &mut Transaction<'_, Postgres>,
 	dataset_id: Uuid,
 ) -> Result<Option<Dataset>, sqlx::Error> {
 	sqlx::query_as::<_, Dataset>("SELECT * FROM datasets WHERE id = $1")
 		.bind(dataset_id)
-		.fetch_optional(&state.db)
+		.fetch_optional(&mut **tx)
 		.await
 }

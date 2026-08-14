@@ -46,6 +46,8 @@ pub struct ContractRow {
 	pub expires_at: DateTime<Utc>,
 	pub created_at: DateTime<Utc>,
 	pub updated_at: DateTime<Utc>,
+	#[allow(dead_code)]
+	pub tenant_id: uuid::Uuid,
 }
 
 impl TryFrom<ContractRow> for SharingContract {
